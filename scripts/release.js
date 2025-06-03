@@ -57,14 +57,24 @@ function bumpVersion() {
   const packageJsonPath = path.join(process.cwd(), 'package.json');
   const packageJson = JSON.parse(fs.readFileSync(packageJsonPath, 'utf8'));
   
-  // Parse current version and add 0.01
-  let currentVersion = parseFloat(packageJson.version);
-  if (isNaN(currentVersion)) {
-    console.error('Invalid version format in package.json');
+  // Parse current version
+  const versionParts = packageJson.version.split('.');
+  if (versionParts.length !== 3) {
+    console.error('Invalid version format in package.json. Expected format: X.Y.Z');
     process.exit(1);
   }
   
-  const newVersion = (currentVersion + 0.01).toFixed(2);
+  // Extract major, minor, patch
+  const major = parseInt(versionParts[0], 10);
+  let minor = parseFloat(versionParts[1], 10);
+  const patch = parseInt(versionParts[2], 10);
+  
+  // Add 0.01 to minor version
+  minor = minor + 0.01;
+  
+  // Format new version
+  const newVersion = `${major}.${minor.toFixed(2).replace(/\.00$/, '.0')}.${patch}`;
+  
   console.log(`Bumping version from ${packageJson.version} to ${newVersion}`);
   
   if (!options.dryRun) {
