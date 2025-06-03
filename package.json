@@ -1,13 +1,14 @@
 {
-  "name": "dev-code-refinery",
-  "displayName": "Dev Code Refinery",
+  "name": "code-refinery",
+  "displayName": "code Refinery",
   "description": "Refine your codebase with ease: rename files, generate index.ts, and more!",
-  "version": "0.9.0",
+  "version": "0.10.0",
   "author": "Remco Stoeten",
+  "publisher": "remcostoeten",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/remcostoeten/vscode-personal-utilities"
+    "url": "https://github.com/remcostoeten/vscode-code-refinery"
   },
   "engines": {
     "vscode": "^1.80.0"
