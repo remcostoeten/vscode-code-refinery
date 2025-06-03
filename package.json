@@ -1,0 +1,73 @@
+{
+  "name": "dev-code-refinery",
+  "displayName": "Dev Code Refinery",
+  "description": "Refine your codebase with ease: rename files, generate index.ts, and more!",
+  "version": "0.9.0",
+  "author": "Remco Stoeten",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/remcostoeten/vscode-personal-utilities"
+  },
+  "engines": {
+    "vscode": "^1.80.0"
+  },
+  "categories": ["Other"],
+  "activationEvents": [
+    "onCommand:file-utils.renameFile",
+    "onCommand:file-utils.exportIndex"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "file-utils.renameFile",
+        "title": "Convert Filename to kebab-case"
+      },
+      {
+        "command": "file-utils.exportIndex",
+        "title": "Generate index.ts with exports"
+      }
+    ],
+    "menus": {
+      "explorer/context": [
+        {
+          "command": "file-utils.renameFile",
+          "when": "resourceFilename",
+          "group": "navigation"
+        },
+        {
+          "command": "file-utils.exportIndex",
+          "when": "resourceDirname",
+          "group": "navigation"
+        }
+      ]
+    },
+    "keybindings": [
+      {
+        "command": "file-utils.renameFile",
+        "key": "ctrl+alt+k",
+        "when": "explorerViewletVisible && filesExplorerFocus"
+      },
+      {
+        "command": "file-utils.exportIndex",
+        "key": "ctrl+alt+i",
+        "when": "explorerViewletVisible && filesExplorerFocus"
+      }
+    ]
+  },
+  "scripts": {
+    "compile": "tsc -p .",
+    "watch": "tsc -watch -p .",
+    "lint": "eslint src --ext ts",
+    "package": "vsce package",
+    "publish": "vsce publish",
+    "release": "node scripts/release.js"
+  },
+  "devDependencies": {
+    "@types/node": "^20.4.2",
+    "@types/vscode": "^1.80.0",
+    "typescript": "^5.3.3",
+    "vsce": "2.15.0"
+  }
+}

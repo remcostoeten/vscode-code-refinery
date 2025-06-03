@@ -1,0 +1,30 @@
+# VS Code extension specific
+.vscode-test/
+*.vsix
+
+# Dependency directories
+node_modules/
+out/
+dist/
+
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Environment files
+.env
+.env.local
+
+# OS specific files
+.DS_Store
+Thumbs.db
+
+# Editor settings
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
