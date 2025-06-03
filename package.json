@@ -2,7 +2,7 @@
   "name": "code-refinery",
   "displayName": "code Refinery",
   "description": "Refine your codebase with ease: rename files, generate index.ts, and more!",
-  "version": "0.11",
+  "version": "0.10.0",
   "author": "Remco Stoeten",
   "publisher": "remcostoeten",
   "license": "MIT",
