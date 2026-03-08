@@ -1,5 +1,16 @@
 import * as vscode from 'vscode';
 import * as path from 'path';
+import * as ts from 'typescript';
+import {
+  buildExportDeclarationText,
+  buildTypeAliasFromInterface,
+  collectDefaultToNamedReferenceRewrites,
+  collectNamedToDefaultReferenceRewrites,
+  createSourceFile,
+  getTopLevelTypeLikeDecls,
+  type TExportRewrite,
+  type TTypeLikeDecl
+} from './refactor-core';
 
 let outputChannel: vscode.OutputChannel | undefined;
 
@@ -87,245 +98,293 @@ function isTextLikeFile(filePath: string): boolean {
   return /\.(?:ts|tsx|js|jsx|mts|cts|mjs|cjs)$/.test(filePath);
 }
 
-type TTypeLikeDecl = {
-  name: string;
-  exported: boolean;
-  nameOffset: number;
+const workspaceTsInclude = '**/*.{ts,tsx}';
+const workspaceTsExclude = '{**/node_modules/**,**/.git/**,**/dist/**,**/out/**,**/build/**,**/.next/**,**/coverage/**}';
+const unusedDiagnosticCodes = new Set([6133, 6192, 6196, 6198]);
+
+type TTsServiceContext = {
+  languageService: ts.LanguageService;
+  rootPath: string;
 };
 
-function getTopLevelTypeLikeDecls(text: string): TTypeLikeDecl[] {
-  const decls: Array<{ name: string; exported: boolean; nameOffset: number }> = [];
-  const exportedNames = new Set<string>();
+type TUnusedCategory = 'imports' | 'types' | 'interfaces' | 'exports' | 'functions' | 'variables';
 
-  let i = 0;
-  let depthParen = 0;
-  let depthBrace = 0;
-  let depthBracket = 0;
-  let inSingleQuote = false;
-  let inDoubleQuote = false;
-  let inTemplate = false;
-  let inLineComment = false;
-  let inBlockComment = false;
+function hasModifier(node: ts.Node, kind: ts.SyntaxKind): boolean {
+  const modifiers = ts.canHaveModifiers(node) ? ts.getModifiers(node) : undefined;
+  return Boolean(modifiers?.some((modifier) => modifier.kind === kind));
+}
 
-  const isIdentStart = (c: string) => /[A-Za-z_$]/.test(c);
-  const isIdentPart = (c: string) => /[A-Za-z0-9_$]/.test(c);
-  const skipWs = () => {
-    while (i < text.length && /\s/.test(text[i])) i++;
+function resolveTargetUri(uri?: vscode.Uri): vscode.Uri | undefined {
+  if (uri) {
+    return uri;
+  }
+
+  const activeUri = vscode.window.activeTextEditor?.document.uri;
+  return activeUri?.scheme === 'file' ? activeUri : undefined;
+}
+
+async function findWorkspaceTypeScriptFiles(): Promise<string[]> {
+  const uris = await vscode.workspace.findFiles(workspaceTsInclude, workspaceTsExclude);
+  return uris.map((uri) => uri.fsPath);
+}
+
+async function createTypeScriptLanguageService(targetFilePath: string): Promise<TTsServiceContext> {
+  const workspaceFolder = vscode.workspace.getWorkspaceFolder(vscode.Uri.file(targetFilePath))
+    ?? vscode.workspace.workspaceFolders?.[0];
+  const rootPath = workspaceFolder?.uri.fsPath ?? path.dirname(targetFilePath);
+
+  let options: ts.CompilerOptions = {
+    target: ts.ScriptTarget.ES2020,
+    module: ts.ModuleKind.ESNext,
+    jsx: ts.JsxEmit.Preserve,
+    moduleResolution: ts.ModuleResolutionKind.NodeJs,
+    esModuleInterop: true,
+    allowJs: false,
+    skipLibCheck: true
   };
-  const readIdent = () => {
-    if (!isIdentStart(text[i] ?? '')) return undefined;
-    const start = i;
-    i++;
-    while (i < text.length && isIdentPart(text[i])) i++;
-    return { value: text.slice(start, i), start };
-  };
-  const atTopLevel = () => depthParen === 0 && depthBrace === 0 && depthBracket === 0;
 
-  const consumeStringLike = (quote: "'" | '"' | '`') => {
-    // Caller has already observed starting quote at text[i].
-    i++;
-    while (i < text.length) {
-      const c = text[i];
-      if (c === '\\') {
-        i += 2;
-        continue;
-      }
-      if (quote === '`' && c === '$' && text[i + 1] === '{') {
-        // Enter template expression. We treat it as normal code.
-        i += 2;
-        depthBrace++;
-        return;
-      }
-      if (c === quote) {
-        i++;
-        return;
-      }
-      i++;
+  let fileNames: string[] = [];
+  const configPath = ts.findConfigFile(rootPath, ts.sys.fileExists, 'tsconfig.json');
+  if (configPath) {
+    const configFile = ts.readConfigFile(configPath, ts.sys.readFile);
+    if (!configFile.error) {
+      const parsed = ts.parseJsonConfigFileContent(configFile.config, ts.sys, path.dirname(configPath));
+      options = { ...options, ...parsed.options };
+      fileNames = parsed.fileNames.filter((fileName) => /\.(ts|tsx)$/.test(fileName));
     }
+  }
+
+  if (fileNames.length === 0) {
+    fileNames = await findWorkspaceTypeScriptFiles();
+  }
+
+  if (!fileNames.includes(targetFilePath)) {
+    fileNames.push(targetFilePath);
+  }
+
+  const openDocs = new Map<string, string>();
+  for (const doc of vscode.workspace.textDocuments) {
+    if (doc.uri.scheme === 'file' && /\.(ts|tsx)$/.test(doc.uri.fsPath)) {
+      openDocs.set(doc.uri.fsPath, doc.getText());
+    }
+  }
+
+  const host: ts.LanguageServiceHost = {
+    getCompilationSettings: () => options,
+    getCurrentDirectory: () => rootPath,
+    getDefaultLibFileName: ts.getDefaultLibFilePath,
+    getNewLine: () => ts.sys.newLine,
+    getScriptFileNames: () => fileNames,
+    getScriptVersion: () => '0',
+    getScriptSnapshot: (fileName) => {
+      const text = openDocs.get(fileName) ?? ts.sys.readFile(fileName);
+      return text === undefined ? undefined : ts.ScriptSnapshot.fromString(text);
+    },
+    fileExists: ts.sys.fileExists,
+    readFile: ts.sys.readFile,
+    readDirectory: ts.sys.readDirectory,
+    directoryExists: ts.sys.directoryExists,
+    getDirectories: ts.sys.getDirectories,
+    useCaseSensitiveFileNames: () => ts.sys.useCaseSensitiveFileNames
   };
 
-  const scanExportListAt = (startIdx: number) => {
-    // startIdx points right after "export" (and optional "type").
-    const oldI = i;
-    i = startIdx;
-    skipWs();
-    if (text[i] !== '{') {
-      i = oldI;
+  return {
+    languageService: ts.createLanguageService(host, ts.createDocumentRegistry()),
+    rootPath
+  };
+}
+
+async function applyFileTextChanges(edit: vscode.WorkspaceEdit, uri: vscode.Uri, changes: readonly ts.TextChange[]): Promise<number> {
+  const doc = await vscode.workspace.openTextDocument(uri);
+  const accepted: ts.TextChange[] = [];
+  let nextExclusiveEnd = Number.POSITIVE_INFINITY;
+
+  for (const change of [...changes].sort((left, right) => right.span.start - left.span.start)) {
+    const end = change.span.start + change.span.length;
+    if (end > nextExclusiveEnd) {
+      continue;
+    }
+
+    accepted.push(change);
+    nextExclusiveEnd = change.span.start;
+  }
+
+  for (const change of accepted) {
+    edit.replace(
+      uri,
+      new vscode.Range(
+        doc.positionAt(change.span.start),
+        doc.positionAt(change.span.start + change.span.length)
+      ),
+      change.newText
+    );
+  }
+
+  return accepted.length;
+}
+
+async function applyTsFileChanges(fileChanges: readonly ts.FileTextChanges[]): Promise<number> {
+  const workspaceEdit = new vscode.WorkspaceEdit();
+  let total = 0;
+
+  for (const fileChange of fileChanges) {
+    total += await applyFileTextChanges(workspaceEdit, vscode.Uri.file(fileChange.fileName), fileChange.textChanges);
+  }
+
+  if (total === 0) {
+    return 0;
+  }
+
+  const applied = await vscode.workspace.applyEdit(workspaceEdit);
+  return applied ? total : 0;
+}
+
+function getSourceFileFromService(languageService: ts.LanguageService, filePath: string): ts.SourceFile | undefined {
+  return languageService.getProgram()?.getSourceFile(filePath);
+}
+
+function getLocalSymbolName(node: ts.NamedDeclaration): ts.Identifier | undefined {
+  if (node.name && ts.isIdentifier(node.name)) {
+    return node.name;
+  }
+
+  if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name)) {
+    return node.name;
+  }
+
+  return undefined;
+}
+
+function getImportSpecifierCandidates(fromFilePath: string, targetFilePath: string): Set<string> {
+  return new Set(getImportCandidateSpecifiers(fromFilePath, targetFilePath));
+}
+
+function findDeepestNodeAtPosition(sourceFile: ts.SourceFile, position: number): ts.Node | undefined {
+  let found: ts.Node | undefined;
+
+  const visit = (node: ts.Node) => {
+    if (position < node.getFullStart() || position >= node.getEnd()) {
       return;
     }
-    i++; // '{'
-    while (i < text.length) {
-      skipWs();
-      if (text[i] === '}') {
-        i++;
-        break;
-      }
-      const ident = readIdent();
-      if (!ident) {
-        i++;
-        continue;
-      }
-      exportedNames.add(ident.value);
-      skipWs();
-      if (text.slice(i, i + 2) === 'as') {
-        // export { Foo as Bar } exports Bar, but the local symbol is Foo. We care about whether Foo is exported.
-        // Foo is already added above; ignore Bar.
-        i += 2;
-        skipWs();
-        readIdent();
-      }
-      while (i < text.length && text[i] !== ',' && text[i] !== '}') i++;
-      if (text[i] === ',') i++;
-    }
-    i = oldI;
+
+    found = node;
+    ts.forEachChild(node, visit);
   };
 
-  while (i < text.length) {
-    const c = text[i];
-    const n = text[i + 1];
+  visit(sourceFile);
+  return found;
+}
 
-    if (inLineComment) {
-      if (c === '\n') inLineComment = false;
-      i++;
-      continue;
+function classifyUnusedDiagnostic(sourceFile: ts.SourceFile, start: number): Exclude<TUnusedCategory, 'exports'> | undefined {
+  let node = findDeepestNodeAtPosition(sourceFile, start);
+  while (node) {
+    if (
+      ts.isImportClause(node)
+      || ts.isImportSpecifier(node)
+      || ts.isNamespaceImport(node)
+      || ts.isImportEqualsDeclaration(node)
+      || ts.isImportDeclaration(node)
+    ) {
+      return 'imports';
     }
-    if (inBlockComment) {
-      if (c === '*' && n === '/') {
-        inBlockComment = false;
-        i += 2;
+    if (ts.isInterfaceDeclaration(node)) {
+      return 'interfaces';
+    }
+    if (ts.isTypeAliasDeclaration(node)) {
+      return 'types';
+    }
+    if (ts.isFunctionDeclaration(node)) {
+      return 'functions';
+    }
+    if (ts.isVariableDeclaration(node)) {
+      return 'variables';
+    }
+    node = node.parent;
+  }
+
+  return undefined;
+}
+
+function isExportReferenceNode(node: ts.Node | undefined): boolean {
+  let current = node;
+  while (current) {
+    if (ts.isExportSpecifier(current) || ts.isExportAssignment(current) || ts.isExportDeclaration(current)) {
+      return true;
+    }
+    current = current.parent;
+  }
+  return false;
+}
+
+function collectReferenceUsage(
+  languageService: ts.LanguageService,
+  filePath: string,
+  sourceFile: ts.SourceFile,
+  identifier: ts.Identifier
+): { external: number; local: number } {
+  const refs = languageService.findReferences(filePath, identifier.getStart(sourceFile)) ?? [];
+  const definitionStart = identifier.getStart(sourceFile);
+  const definitionLength = identifier.getWidth(sourceFile);
+
+  let external = 0;
+  let local = 0;
+
+  for (const refGroup of refs) {
+    for (const ref of refGroup.references) {
+      if (ref.fileName !== filePath) {
+        external++;
         continue;
       }
-      i++;
-      continue;
-    }
-    if (inSingleQuote) {
-      inSingleQuote = false;
-      consumeStringLike("'");
-      continue;
-    }
-    if (inDoubleQuote) {
-      inDoubleQuote = false;
-      consumeStringLike('"');
-      continue;
-    }
-    if (inTemplate) {
-      inTemplate = false;
-      consumeStringLike('`');
-      continue;
-    }
 
-    if (c === '/' && n === '/') {
-      inLineComment = true;
-      i += 2;
-      continue;
-    }
-    if (c === '/' && n === '*') {
-      inBlockComment = true;
-      i += 2;
-      continue;
-    }
-    if (c === "'") {
-      inSingleQuote = true;
-      continue;
-    }
-    if (c === '"') {
-      inDoubleQuote = true;
-      continue;
-    }
-    if (c === '`') {
-      inTemplate = true;
-      continue;
-    }
-
-    if (c === '(') depthParen++;
-    else if (c === ')') depthParen = Math.max(0, depthParen - 1);
-    else if (c === '{') depthBrace++;
-    else if (c === '}') depthBrace = Math.max(0, depthBrace - 1);
-    else if (c === '[') depthBracket++;
-    else if (c === ']') depthBracket = Math.max(0, depthBracket - 1);
-
-    if (!atTopLevel()) {
-      i++;
-      continue;
-    }
-
-    if (!isIdentStart(c)) {
-      i++;
-      continue;
-    }
-
-    const word = readIdent();
-    if (!word) {
-      i++;
-      continue;
-    }
-
-    const wordValue = word.value;
-
-    if (wordValue === 'export') {
-      const exportStart = i;
-      skipWs();
-      const maybeType = (() => {
-        const saved = i;
-        const w = readIdent();
-        if (!w) return { kind: 'none' as const, idx: saved };
-        return { kind: w.value, idx: i };
-      })();
-
-      if (maybeType.kind === 'type' || maybeType.kind === 'interface') {
-        // export type Foo ...
-        // export interface Foo ...
-        skipWs();
-        const nameIdent = readIdent();
-        if (nameIdent) {
-          decls.push({ name: nameIdent.value, exported: true, nameOffset: nameIdent.start });
-          exportedNames.add(nameIdent.value);
-        }
-      } else {
-        // export { Foo, Bar as Baz }
-        // export type { Foo }
-        // Handle optional "type" keyword (TypeScript export type { ... }).
-        if (maybeType.kind === 'type') {
-          scanExportListAt(maybeType.idx);
-        } else {
-          scanExportListAt(exportStart);
-        }
+      const isDefinition = ref.textSpan.start === definitionStart && ref.textSpan.length === definitionLength;
+      if (isDefinition) {
+        continue;
       }
 
-      i++;
-      continue;
-    }
-
-    if (wordValue === 'declare') {
-      skipWs();
-      const next = readIdent();
-      if (next?.value === 'type' || next?.value === 'interface') {
-        skipWs();
-        const nameIdent = readIdent();
-        if (nameIdent) {
-          decls.push({ name: nameIdent.value, exported: false, nameOffset: nameIdent.start });
-        }
+      const localNode = findDeepestNodeAtPosition(sourceFile, ref.textSpan.start);
+      if (isExportReferenceNode(localNode)) {
+        continue;
       }
-      continue;
-    }
 
-    if (wordValue === 'type' || wordValue === 'interface') {
-      skipWs();
-      const nameIdent = readIdent();
-      if (nameIdent) {
-        decls.push({ name: nameIdent.value, exported: false, nameOffset: nameIdent.start });
-      }
-      continue;
+      local++;
     }
   }
 
-  for (const d of decls) {
-    if (!d.exported && exportedNames.has(d.name)) {
-      d.exported = true;
-    }
+  return { external, local };
+}
+
+function getDeletionRange(sourceFile: ts.SourceFile, node: ts.Node): { start: number; end: number } {
+  const text = sourceFile.getFullText();
+  let start = node.getFullStart();
+  let end = node.getEnd();
+
+  while (end < text.length && (text[end] === '\r' || text[end] === '\n')) {
+    end++;
   }
 
-  return decls;
+  return { start, end };
+}
+
+function getExportModifierRemovalRange(sourceFile: ts.SourceFile, node: ts.Node): { start: number; end: number } | undefined {
+  const modifiers = ts.canHaveModifiers(node) ? ts.getModifiers(node) : undefined;
+  const exportModifier = modifiers?.find((modifier) => modifier.kind === ts.SyntaxKind.ExportKeyword);
+  if (!exportModifier) {
+    return undefined;
+  }
+
+  let start = exportModifier.getStart(sourceFile);
+  let end = exportModifier.getEnd();
+  const defaultModifier = modifiers?.find((modifier) => modifier.kind === ts.SyntaxKind.DefaultKeyword);
+  if (defaultModifier) {
+    end = defaultModifier.getEnd();
+  }
+
+  const text = sourceFile.getFullText();
+  while (end < text.length && /\s/.test(text[end])) {
+    end++;
+  }
+
+  return { start, end };
 }
 
 async function fixPropsType(uri: vscode.Uri) {
@@ -360,21 +419,17 @@ async function fixPropsType(uri: vscode.Uri) {
   }
 
   const nonExported = decls.filter((d) => !d.exported);
-  const exported = decls.filter((d) => d.exported);
 
-  // Rules:
+  // Rule:
   // - total == 1 and it is non-exported -> rename to Props
-  // - total == 2 and exactly one is non-exported and one is exported -> rename the non-exported to Props
   let target: TTypeLikeDecl | undefined;
   if (decls.length === 1 && nonExported.length === 1) {
-    target = nonExported[0];
-  } else if (decls.length === 2 && nonExported.length === 1 && exported.length === 1) {
     target = nonExported[0];
   }
 
   if (!target) {
     vscode.window.showInformationMessage(
-      'No eligible local type/interface to rename. This runs only when the file has exactly 1 local type/interface, or exactly 2 where 1 is exported and 1 is local.'
+      'No eligible local type/interface to rename. This runs only when the file has exactly 1 top-level type/interface declaration and it is not exported.'
     );
     return;
   }
@@ -403,8 +458,595 @@ async function fixPropsType(uri: vscode.Uri) {
     return;
   }
 
+  if (target.kind === 'interface') {
+    const updatedDoc = await vscode.workspace.openTextDocument(uri);
+    const updatedDecls = getTopLevelTypeLikeDecls(updatedDoc.getText());
+    const propsDecl = updatedDecls.find((decl) => !decl.exported && decl.name === 'Props');
+    const conversion = propsDecl ? buildTypeAliasFromInterface(updatedDoc.getText(), propsDecl) : undefined;
+
+    if (!conversion) {
+      vscode.window.showErrorMessage('Renamed to Props, but failed to convert the interface to a type alias.');
+      return;
+    }
+
+    const interfaceEdit = new vscode.WorkspaceEdit();
+    interfaceEdit.replace(
+      uri,
+      new vscode.Range(
+        updatedDoc.positionAt(conversion.start),
+        updatedDoc.positionAt(conversion.end)
+      ),
+      conversion.replacement
+    );
+
+    const converted = await vscode.workspace.applyEdit(interfaceEdit);
+    if (!converted) {
+      vscode.window.showErrorMessage('Renamed to Props, but failed to convert the interface to a type alias.');
+      return;
+    }
+  }
+
   await doc.save();
-  vscode.window.showInformationMessage(`Renamed ${target.name} to Props.`);
+  vscode.window.showInformationMessage(`Renamed ${target.name} to Props as a type.`);
+}
+
+async function updateWorkspaceReferencesForExportConversion(
+  targetFilePath: string,
+  exportName: string,
+  mode: 'default-to-named' | 'named-to-default'
+): Promise<{ filesChanged: number; editsApplied: number }> {
+  const channel = getOutputChannel();
+  const files = await findWorkspaceTypeScriptFiles();
+  const workspaceEdit = new vscode.WorkspaceEdit();
+  let filesChanged = 0;
+  let editsApplied = 0;
+
+  for (const filePath of files) {
+    const uri = vscode.Uri.file(filePath);
+    const doc = await vscode.workspace.openTextDocument(uri);
+    const text = doc.getText();
+    const sourceFile = createSourceFile(filePath, text);
+    const moduleSpecifiers = getImportSpecifierCandidates(filePath, targetFilePath);
+    const rewrites = mode === 'default-to-named'
+      ? collectDefaultToNamedReferenceRewrites(sourceFile, moduleSpecifiers, exportName)
+      : collectNamedToDefaultReferenceRewrites(sourceFile, moduleSpecifiers, exportName);
+
+    if (rewrites.length === 0) {
+      continue;
+    }
+
+    filesChanged++;
+    editsApplied += rewrites.length;
+
+    for (const rewrite of rewrites.sort((left, right) => right.start - left.start)) {
+      workspaceEdit.replace(
+        uri,
+        new vscode.Range(doc.positionAt(rewrite.start), doc.positionAt(rewrite.end)),
+        rewrite.replacement
+      );
+    }
+
+    channel.appendLine(
+      `[exports] ${path.relative(vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? '', filePath)}: ${rewrites.length} update(s)`
+    );
+  }
+
+  if (editsApplied > 0) {
+    await vscode.workspace.applyEdit(workspaceEdit);
+  }
+
+  return { filesChanged, editsApplied };
+}
+
+async function convertDefaultExportToNamed(uri?: vscode.Uri) {
+  const targetUri = resolveTargetUri(uri);
+  if (!targetUri) {
+    vscode.window.showErrorMessage('No file selected.');
+    return;
+  }
+
+  const doc = await vscode.workspace.openTextDocument(targetUri);
+  if (!/\.(ts|tsx)$/.test(doc.uri.fsPath)) {
+    vscode.window.showErrorMessage('Please select a .ts or .tsx file.');
+    return;
+  }
+
+  const sourceFile = createSourceFile(doc.uri.fsPath, doc.getText());
+  let exportName: string | undefined;
+  let rewrite: TExportRewrite | undefined;
+
+  for (const statement of sourceFile.statements) {
+    if (
+      (ts.isFunctionDeclaration(statement) || ts.isClassDeclaration(statement))
+      && hasModifier(statement, ts.SyntaxKind.ExportKeyword)
+      && hasModifier(statement, ts.SyntaxKind.DefaultKeyword)
+      && statement.name
+    ) {
+      const defaultModifier = ts.getModifiers(statement)?.find((modifier) => modifier.kind === ts.SyntaxKind.DefaultKeyword);
+      if (!defaultModifier) {
+        continue;
+      }
+
+      exportName = statement.name.text;
+      let end = defaultModifier.getEnd();
+      const text = sourceFile.getFullText();
+      while (end < text.length && /\s/.test(text[end])) {
+        end++;
+      }
+
+      rewrite = {
+        start: defaultModifier.getStart(sourceFile),
+        end,
+        replacement: ''
+      };
+      break;
+    }
+
+    if (ts.isExportAssignment(statement) && !statement.isExportEquals && ts.isIdentifier(statement.expression)) {
+      exportName = statement.expression.text;
+      rewrite = {
+        start: statement.getStart(sourceFile),
+        end: statement.getEnd(),
+        replacement: `export { ${exportName} };`
+      };
+      break;
+    }
+
+    if (
+      ts.isExportDeclaration(statement)
+      && !statement.moduleSpecifier
+      && statement.exportClause
+      && ts.isNamedExports(statement.exportClause)
+    ) {
+      const defaultSpecifier = statement.exportClause.elements.find((element) => element.name.text === 'default');
+      if (!defaultSpecifier) {
+        continue;
+      }
+
+      const localName = defaultSpecifier.propertyName?.text;
+      if (!localName) {
+        continue;
+      }
+
+      exportName = localName;
+      const specifiers = statement.exportClause.elements.map((element) => {
+        if (element !== defaultSpecifier) {
+          return element.getText(sourceFile);
+        }
+        return localName;
+      });
+      rewrite = {
+        start: statement.getStart(sourceFile),
+        end: statement.getEnd(),
+        replacement: buildExportDeclarationText(sourceFile, statement, specifiers)
+      };
+      break;
+    }
+  }
+
+  if (!exportName || !rewrite) {
+    vscode.window.showInformationMessage(
+      'No supported default export found. Supported cases: named default function/class, `export default Foo`, or `export { Foo as default }`.'
+    );
+    return;
+  }
+
+  const edit = new vscode.WorkspaceEdit();
+  edit.replace(targetUri, new vscode.Range(doc.positionAt(rewrite.start), doc.positionAt(rewrite.end)), rewrite.replacement);
+  const applied = await vscode.workspace.applyEdit(edit);
+  if (!applied) {
+    vscode.window.showErrorMessage('Failed to update the export declaration.');
+    return;
+  }
+
+  const summary = await updateWorkspaceReferencesForExportConversion(doc.uri.fsPath, exportName, 'default-to-named');
+  await doc.save();
+
+  const action = await vscode.window.showInformationMessage(
+    `Converted default export to named export \`${exportName}\`. Updated ${summary.editsApplied} reference(s) in ${summary.filesChanged} file(s).`,
+    'Show details'
+  );
+  if (action === 'Show details') {
+    getOutputChannel().show(true);
+  }
+}
+
+async function convertNamedExportToDefault(uri?: vscode.Uri) {
+  const targetUri = resolveTargetUri(uri);
+  if (!targetUri) {
+    vscode.window.showErrorMessage('No file selected.');
+    return;
+  }
+
+  const doc = await vscode.workspace.openTextDocument(targetUri);
+  if (!/\.(ts|tsx)$/.test(doc.uri.fsPath)) {
+    vscode.window.showErrorMessage('Please select a .ts or .tsx file.');
+    return;
+  }
+
+  const sourceFile = createSourceFile(doc.uri.fsPath, doc.getText());
+  const candidates: Array<{ exportName: string; rewrite: TExportRewrite }> = [];
+
+  for (const statement of sourceFile.statements) {
+    if (
+      (ts.isFunctionDeclaration(statement) || ts.isClassDeclaration(statement))
+      && hasModifier(statement, ts.SyntaxKind.ExportKeyword)
+      && !hasModifier(statement, ts.SyntaxKind.DefaultKeyword)
+      && statement.name
+    ) {
+      const exportModifier = ts.getModifiers(statement)?.find((modifier) => modifier.kind === ts.SyntaxKind.ExportKeyword);
+      if (!exportModifier) {
+        continue;
+      }
+
+      let end = exportModifier.getEnd();
+      const text = sourceFile.getFullText();
+      while (end < text.length && /\s/.test(text[end])) {
+        end++;
+      }
+
+      candidates.push({
+        exportName: statement.name.text,
+        rewrite: {
+          start: exportModifier.getStart(sourceFile),
+          end,
+          replacement: 'export default '
+        }
+      });
+      continue;
+    }
+
+    if (ts.isVariableStatement(statement) && hasModifier(statement, ts.SyntaxKind.ExportKeyword)) {
+      if (statement.declarationList.declarations.length !== 1) {
+        continue;
+      }
+
+      const declaration = statement.declarationList.declarations[0];
+      if (!ts.isIdentifier(declaration.name)) {
+        continue;
+      }
+
+      const removal = getExportModifierRemovalRange(sourceFile, statement);
+      if (!removal) {
+        continue;
+      }
+
+      const statementText = sourceFile.getFullText().slice(removal.end, statement.getEnd());
+      candidates.push({
+        exportName: declaration.name.text,
+        rewrite: {
+          start: statement.getStart(sourceFile),
+          end: statement.getEnd(),
+          replacement: `${statementText}\nexport default ${declaration.name.text};`
+        }
+      });
+      continue;
+    }
+
+    if (
+      ts.isExportDeclaration(statement)
+      && !statement.moduleSpecifier
+      && statement.exportClause
+      && ts.isNamedExports(statement.exportClause)
+      && statement.exportClause.elements.length === 1
+    ) {
+      const element = statement.exportClause.elements[0];
+      const localName = element.propertyName?.text ?? element.name.text;
+      candidates.push({
+        exportName: localName,
+        rewrite: {
+          start: statement.getStart(sourceFile),
+          end: statement.getEnd(),
+          replacement: `export default ${localName};`
+        }
+      });
+    }
+  }
+
+  if (candidates.length !== 1) {
+    vscode.window.showInformationMessage(
+      'Named-to-default conversion runs only when the file has exactly 1 supported named value export and no ambiguity.'
+    );
+    return;
+  }
+
+  const candidate = candidates[0];
+  const edit = new vscode.WorkspaceEdit();
+  edit.replace(
+    targetUri,
+    new vscode.Range(doc.positionAt(candidate.rewrite.start), doc.positionAt(candidate.rewrite.end)),
+    candidate.rewrite.replacement
+  );
+  const applied = await vscode.workspace.applyEdit(edit);
+  if (!applied) {
+    vscode.window.showErrorMessage('Failed to update the export declaration.');
+    return;
+  }
+
+  const summary = await updateWorkspaceReferencesForExportConversion(doc.uri.fsPath, candidate.exportName, 'named-to-default');
+  await doc.save();
+
+  const action = await vscode.window.showInformationMessage(
+    `Converted named export \`${candidate.exportName}\` to default export. Updated ${summary.editsApplied} reference(s) in ${summary.filesChanged} file(s).`,
+    'Show details'
+  );
+  if (action === 'Show details') {
+    getOutputChannel().show(true);
+  }
+}
+
+async function removeUnusedExportsFromFile(uri: vscode.Uri): Promise<number> {
+  const doc = await vscode.workspace.openTextDocument(uri);
+  const context = await createTypeScriptLanguageService(uri.fsPath);
+  const sourceFile = getSourceFileFromService(context.languageService, uri.fsPath);
+  if (!sourceFile) {
+    return 0;
+  }
+
+  const rewrites: TExportRewrite[] = [];
+
+  for (const statement of sourceFile.statements) {
+    if (
+      (ts.isFunctionDeclaration(statement)
+        || ts.isClassDeclaration(statement)
+        || ts.isTypeAliasDeclaration(statement)
+        || ts.isInterfaceDeclaration(statement))
+      && hasModifier(statement, ts.SyntaxKind.ExportKeyword)
+      && statement.name
+    ) {
+      const usage = collectReferenceUsage(context.languageService, uri.fsPath, sourceFile, statement.name);
+      if (usage.external > 0) {
+        continue;
+      }
+
+      if (usage.local === 0) {
+        const range = getDeletionRange(sourceFile, statement);
+        rewrites.push({ start: range.start, end: range.end, replacement: '' });
+      } else {
+        const range = getExportModifierRemovalRange(sourceFile, statement);
+        if (range) {
+          rewrites.push({ start: range.start, end: range.end, replacement: '' });
+        }
+      }
+      continue;
+    }
+
+    if (ts.isVariableStatement(statement) && hasModifier(statement, ts.SyntaxKind.ExportKeyword)) {
+      if (statement.declarationList.declarations.length !== 1) {
+        continue;
+      }
+
+      const declaration = statement.declarationList.declarations[0];
+      if (!ts.isIdentifier(declaration.name)) {
+        continue;
+      }
+
+      const usage = collectReferenceUsage(context.languageService, uri.fsPath, sourceFile, declaration.name);
+      if (usage.external > 0) {
+        continue;
+      }
+
+      if (usage.local === 0) {
+        const range = getDeletionRange(sourceFile, statement);
+        rewrites.push({ start: range.start, end: range.end, replacement: '' });
+      } else {
+        const range = getExportModifierRemovalRange(sourceFile, statement);
+        if (range) {
+          rewrites.push({ start: range.start, end: range.end, replacement: '' });
+        }
+      }
+      continue;
+    }
+
+    if (
+      ts.isExportDeclaration(statement)
+      && !statement.moduleSpecifier
+      && statement.exportClause
+      && ts.isNamedExports(statement.exportClause)
+    ) {
+      const kept = statement.exportClause.elements.filter((element) => {
+        const localIdentifier = element.propertyName ?? element.name;
+        if (!ts.isIdentifier(localIdentifier)) {
+          return true;
+        }
+        const usage = collectReferenceUsage(context.languageService, uri.fsPath, sourceFile, localIdentifier);
+        return usage.external > 0;
+      });
+
+      if (kept.length === statement.exportClause.elements.length) {
+        continue;
+      }
+
+      if (kept.length === 0) {
+        const range = getDeletionRange(sourceFile, statement);
+        rewrites.push({ start: range.start, end: range.end, replacement: '' });
+      } else {
+        rewrites.push({
+          start: statement.getStart(sourceFile),
+          end: statement.getEnd(),
+          replacement: buildExportDeclarationText(sourceFile, statement, kept.map((element) => element.getText(sourceFile)))
+        });
+      }
+      continue;
+    }
+
+    if (ts.isExportAssignment(statement) && !statement.isExportEquals && ts.isIdentifier(statement.expression)) {
+      const usage = collectReferenceUsage(context.languageService, uri.fsPath, sourceFile, statement.expression);
+      if (usage.external > 0) {
+        continue;
+      }
+
+      const range = getDeletionRange(sourceFile, statement);
+      rewrites.push({ start: range.start, end: range.end, replacement: '' });
+    }
+  }
+
+  if (rewrites.length === 0) {
+    return 0;
+  }
+
+  const edit = new vscode.WorkspaceEdit();
+  for (const rewrite of rewrites.sort((left, right) => right.start - left.start)) {
+    edit.replace(uri, new vscode.Range(doc.positionAt(rewrite.start), doc.positionAt(rewrite.end)), rewrite.replacement);
+  }
+
+  const applied = await vscode.workspace.applyEdit(edit);
+  if (!applied) {
+    return 0;
+  }
+
+  await doc.save();
+  return rewrites.length;
+}
+
+async function removeUnusedFromFile(uri?: vscode.Uri) {
+  const targetUri = resolveTargetUri(uri);
+  if (!targetUri) {
+    vscode.window.showErrorMessage('No file selected.');
+    return;
+  }
+
+  const doc = await vscode.workspace.openTextDocument(targetUri);
+  if (!/\.(ts|tsx)$/.test(doc.uri.fsPath)) {
+    vscode.window.showErrorMessage('Please select a .ts or .tsx file.');
+    return;
+  }
+
+  const picked = await vscode.window.showQuickPick(
+    [
+      { label: 'All', value: 'all' },
+      { label: 'Imports', value: 'imports' },
+      { label: 'Types/Interfaces', value: 'types-and-interfaces' },
+      { label: 'Exports', value: 'exports' },
+      { label: 'Functions', value: 'functions' },
+      { label: 'Variables', value: 'variables' }
+    ],
+    { placeHolder: 'Choose what to remove from the current file' }
+  );
+
+  if (!picked) {
+    return;
+  }
+
+  const selectedCategories: TUnusedCategory[] = picked.value === 'all'
+    ? ['imports', 'types', 'interfaces', 'exports', 'functions', 'variables']
+    : picked.value === 'types-and-interfaces'
+      ? ['types', 'interfaces']
+      : [picked.value as TUnusedCategory];
+
+  const context = await createTypeScriptLanguageService(doc.uri.fsPath);
+  const sourceFile = getSourceFileFromService(context.languageService, doc.uri.fsPath);
+  if (!sourceFile) {
+    vscode.window.showErrorMessage('Failed to analyze this file with TypeScript.');
+    return;
+  }
+
+  let appliedFixes = 0;
+  const tsCategories = selectedCategories.filter((category) => category !== 'exports');
+  if (tsCategories.length > 0) {
+    const diagnostics = context.languageService.getSuggestionDiagnostics(doc.uri.fsPath);
+    const changes: ts.FileTextChanges[] = [];
+
+    for (const diagnostic of diagnostics) {
+      if (diagnostic.start === undefined || !unusedDiagnosticCodes.has(diagnostic.code)) {
+        continue;
+      }
+
+      const category = classifyUnusedDiagnostic(sourceFile, diagnostic.start);
+      if (!category || !tsCategories.includes(category)) {
+        continue;
+      }
+
+      const fixes = context.languageService.getCodeFixesAtPosition(
+        doc.uri.fsPath,
+        diagnostic.start,
+        diagnostic.start + (diagnostic.length ?? 0),
+        [diagnostic.code],
+        {},
+        {}
+      );
+      const fix = fixes.find((candidate) => candidate.changes.length > 0);
+      if (fix) {
+        changes.push(...fix.changes);
+      }
+    }
+
+    appliedFixes += await applyTsFileChanges(changes);
+  }
+
+  let removedExports = 0;
+  if (selectedCategories.includes('exports')) {
+    removedExports = await removeUnusedExportsFromFile(doc.uri);
+  }
+
+  const totalChanges = appliedFixes + removedExports;
+  if (totalChanges === 0) {
+    vscode.window.showInformationMessage('No matching unused code found to remove.');
+    return;
+  }
+
+  await doc.save();
+  vscode.window.showInformationMessage(`Removed unused code with ${totalChanges} change(s).`);
+}
+
+async function convertInterfacesToTypes(uri?: vscode.Uri) {
+  const targetUri = resolveTargetUri(uri);
+  if (!targetUri) {
+    vscode.window.showErrorMessage('No file selected.');
+    return;
+  }
+
+  const doc = await vscode.workspace.openTextDocument(targetUri);
+  if (!/\.(ts|tsx)$/.test(doc.uri.fsPath)) {
+    vscode.window.showErrorMessage('Please select a .ts or .tsx file.');
+    return;
+  }
+
+  const text = doc.getText();
+  const sourceFile = createSourceFile(doc.uri.fsPath, text);
+  const decls = getTopLevelTypeLikeDecls(text).filter((decl) => decl.kind === 'interface');
+  const nameCounts = new Map<string, number>();
+  for (const decl of decls) {
+    nameCounts.set(decl.name, (nameCounts.get(decl.name) ?? 0) + 1);
+  }
+
+  const defaultExportedNames = new Set<string>();
+  for (const statement of sourceFile.statements) {
+    if (ts.isInterfaceDeclaration(statement) && hasModifier(statement, ts.SyntaxKind.DefaultKeyword)) {
+      defaultExportedNames.add(statement.name.text);
+    }
+  }
+
+  const conversions = decls
+    .filter((decl) => (nameCounts.get(decl.name) ?? 0) === 1 && !defaultExportedNames.has(decl.name))
+    .map((decl) => buildTypeAliasFromInterface(text, decl, decl.name))
+    .filter((conversion): conversion is NonNullable<typeof conversion> => Boolean(conversion))
+    .sort((left, right) => right.start - left.start);
+
+  if (conversions.length === 0) {
+    vscode.window.showInformationMessage(
+      'No convertible interfaces found. This skips merged interfaces and default-exported interfaces.'
+    );
+    return;
+  }
+
+  const edit = new vscode.WorkspaceEdit();
+  for (const conversion of conversions) {
+    edit.replace(
+      doc.uri,
+      new vscode.Range(doc.positionAt(conversion.start), doc.positionAt(conversion.end)),
+      conversion.replacement
+    );
+  }
+
+  const applied = await vscode.workspace.applyEdit(edit);
+  if (!applied) {
+    vscode.window.showErrorMessage('Failed to convert interfaces to types.');
+    return;
+  }
+
+  await doc.save();
+  vscode.window.showInformationMessage(`Converted ${conversions.length} interface(s) to type aliases.`);
 }
 
 async function updateImportsForRename(oldUri: vscode.Uri, newUri: vscode.Uri, token: vscode.CancellationToken) {
@@ -683,8 +1325,20 @@ export function activate(context: vscode.ExtensionContext) {
   const renameDisposable = vscode.commands.registerCommand('file-utils.renameFile', renameFileToKebab);
   const exportDisposable = vscode.commands.registerCommand('file-utils.exportIndex', generateIndexFile);
   const fixPropsDisposable = vscode.commands.registerCommand('file-utils.fixPropsType', fixPropsType);
+  const defaultToNamedDisposable = vscode.commands.registerCommand('file-utils.convertDefaultToNamed', convertDefaultExportToNamed);
+  const namedToDefaultDisposable = vscode.commands.registerCommand('file-utils.convertNamedToDefault', convertNamedExportToDefault);
+  const removeUnusedDisposable = vscode.commands.registerCommand('file-utils.removeUnused', removeUnusedFromFile);
+  const convertInterfacesDisposable = vscode.commands.registerCommand('file-utils.convertInterfacesToTypes', convertInterfacesToTypes);
 
-  context.subscriptions.push(renameDisposable, exportDisposable, fixPropsDisposable);
+  context.subscriptions.push(
+    renameDisposable,
+    exportDisposable,
+    fixPropsDisposable,
+    defaultToNamedDisposable,
+    namedToDefaultDisposable,
+    removeUnusedDisposable,
+    convertInterfacesDisposable
+  );
 }
 
 export function deactivate() {

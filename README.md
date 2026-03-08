@@ -11,9 +11,27 @@ Rename files to kebab-case and generate an `index.ts` barrel file exporting all 
   When enabled, the extension also updates relative import specifiers in your workspace that reference the renamed file.
 
 - **Rename Local Type/Interface to Props**
-  For `.ts`/`.tsx` files, renames a single local (non-exported) `type`/`interface` to `Props`:
+  For `.ts`/`.tsx` files, renames a single local (non-exported) `type`/`interface` to `Props`.
+  If the local declaration is an `interface`, it is converted to `type Props = ...`:
   - If the file has exactly 1 type/interface and it is not exported: rename to `Props`.
-  - If the file has exactly 2 types/interfaces, where 1 is exported and 1 is not: rename the non-exported one to `Props`.
+
+- **Convert Default Export to Named Export**
+  For `.ts`/`.tsx` files, converts supported default exports to named exports and updates TS/TSX import and re-export sites in the workspace.
+
+- **Convert Named Export to Default Export**
+  For `.ts`/`.tsx` files, converts a single supported named value export to a default export and updates TS/TSX import and re-export sites in the workspace.
+
+- **Remove Unused from Current TS/TSX File**
+  Removes unused code from the current file with focused options for:
+  - all
+  - imports
+  - types/interfaces
+  - exports
+  - functions
+  - variables
+
+- **Convert Interfaces to Types**
+  Converts top-level interfaces to type aliases where safe. It skips merged interfaces and default-exported interfaces.
 
 - **Generate index.ts Barrel File**
   Create an `index.ts` file exporting all `.ts` and `.tsx` files in the selected folder:
@@ -41,6 +59,11 @@ You can trigger commands via:
 - Command Palette (`Cmd+P` or `Ctrl+P`), search:
   - Convert Filename to kebab-case
   - Generate index.ts with exports
+  - Rename Local Type/Interface to Props
+  - Convert Default Export to Named Export
+  - Convert Named Export to Default Export
+  - Remove Unused from Current TS/TSX File
+  - Convert Interfaces to Types
 
 ## Installation
 

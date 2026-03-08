@@ -19,7 +19,11 @@
   "activationEvents": [
     "onCommand:file-utils.renameFile",
     "onCommand:file-utils.exportIndex",
-    "onCommand:file-utils.fixPropsType"
+    "onCommand:file-utils.fixPropsType",
+    "onCommand:file-utils.convertDefaultToNamed",
+    "onCommand:file-utils.convertNamedToDefault",
+    "onCommand:file-utils.removeUnused",
+    "onCommand:file-utils.convertInterfacesToTypes"
   ],
   "main": "./dist/extension.js",
   "contributes": {
@@ -35,6 +39,22 @@
       {
         "command": "file-utils.fixPropsType",
         "title": "Rename Local Type/Interface to Props"
+      },
+      {
+        "command": "file-utils.convertDefaultToNamed",
+        "title": "Convert Default Export to Named Export"
+      },
+      {
+        "command": "file-utils.convertNamedToDefault",
+        "title": "Convert Named Export to Default Export"
+      },
+      {
+        "command": "file-utils.removeUnused",
+        "title": "Remove Unused from Current TS/TSX File"
+      },
+      {
+        "command": "file-utils.convertInterfacesToTypes",
+        "title": "Convert Interfaces to Types"
       }
     ],
     "configuration": {
@@ -73,6 +93,26 @@
           "command": "file-utils.fixPropsType",
           "when": "resourceScheme == file && !explorerResourceIsFolder && (resourceExtname == .ts || resourceExtname == .tsx)",
           "group": "navigation"
+        },
+        {
+          "command": "file-utils.convertDefaultToNamed",
+          "when": "resourceScheme == file && !explorerResourceIsFolder && (resourceExtname == .ts || resourceExtname == .tsx)",
+          "group": "navigation"
+        },
+        {
+          "command": "file-utils.convertNamedToDefault",
+          "when": "resourceScheme == file && !explorerResourceIsFolder && (resourceExtname == .ts || resourceExtname == .tsx)",
+          "group": "navigation"
+        },
+        {
+          "command": "file-utils.removeUnused",
+          "when": "resourceScheme == file && !explorerResourceIsFolder && (resourceExtname == .ts || resourceExtname == .tsx)",
+          "group": "navigation"
+        },
+        {
+          "command": "file-utils.convertInterfacesToTypes",
+          "when": "resourceScheme == file && !explorerResourceIsFolder && (resourceExtname == .ts || resourceExtname == .tsx)",
+          "group": "navigation"
         }
       ]
     },
@@ -91,6 +131,7 @@
   },
   "scripts": {
     "compile": "tsc -p .",
+    "test": "npm run compile && node test/refactor-core.test.js",
     "watch": "tsc -watch -p .",
     "lint": "eslint src --ext ts",
     "package": "vsce package",
