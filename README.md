@@ -7,7 +7,13 @@ Rename files to kebab-case and generate an `index.ts` barrel file exporting all 
 ## Features
 
 - **Convert Filename to kebab-case**
-  Rename the selected file from `thisCaseName` or `ThisCaseName` to `this-case-name`.
+  Rename the selected file (or multiple selected files) from `thisCaseName` or `ThisCaseName` to `this-case-name`.
+  When enabled, the extension also updates relative import specifiers in your workspace that reference the renamed file.
+
+- **Rename Local Type/Interface to Props**
+  For `.ts`/`.tsx` files, renames a single local (non-exported) `type`/`interface` to `Props`:
+  - If the file has exactly 1 type/interface and it is not exported: rename to `Props`.
+  - If the file has exactly 2 types/interfaces, where 1 is exported and 1 is not: rename the non-exported one to `Props`.
 
 - **Generate index.ts Barrel File**
   Create an `index.ts` file exporting all `.ts` and `.tsx` files in the selected folder:
@@ -15,6 +21,12 @@ Rename files to kebab-case and generate an `index.ts` barrel file exporting all 
   ```ts
   export * from './filename';
   ```
+
+## Settings
+
+- `codeRefinery.rename.updateImports`: Update TS/JS relative import specifiers after renaming files (default: `true`).
+- `codeRefinery.rename.showSummary`: Show a summary message after batch renames (default: `true`).
+- `codeRefinery.rename.revealInExplorer`: Reveal the renamed file in the Explorer (default: `true`).
 
 ## Usage
 
@@ -40,4 +52,3 @@ npm run compile
 ```
 
 Open the folder in VSCode, press `F5` to launch the extension development host, and test commands. Or press `Ctrl+Shift+P` and search for the install extension from location option.
-

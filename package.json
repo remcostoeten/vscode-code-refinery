@@ -18,7 +18,8 @@
   ],
   "activationEvents": [
     "onCommand:file-utils.renameFile",
-    "onCommand:file-utils.exportIndex"
+    "onCommand:file-utils.exportIndex",
+    "onCommand:file-utils.fixPropsType"
   ],
   "main": "./dist/extension.js",
   "contributes": {
@@ -30,18 +31,47 @@
       {
         "command": "file-utils.exportIndex",
         "title": "Generate index.ts with exports"
+      },
+      {
+        "command": "file-utils.fixPropsType",
+        "title": "Rename Local Type/Interface to Props"
       }
     ],
+    "configuration": {
+      "title": "Code Refinery",
+      "properties": {
+        "codeRefinery.rename.updateImports": {
+          "type": "boolean",
+          "default": true,
+          "description": "When renaming files, update TS/JS import specifiers in the workspace that reference the renamed file via a relative path."
+        },
+        "codeRefinery.rename.showSummary": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show a summary message after batch renames."
+        },
+        "codeRefinery.rename.revealInExplorer": {
+          "type": "boolean",
+          "default": true,
+          "description": "Reveal the renamed file in the Explorer after a rename."
+        }
+      }
+    },
     "menus": {
       "explorer/context": [
         {
           "command": "file-utils.renameFile",
-          "when": "resourceFilename",
+          "when": "resourceScheme == file && !explorerResourceIsFolder",
           "group": "navigation"
         },
         {
           "command": "file-utils.exportIndex",
-          "when": "resourceDirname",
+          "when": "resourceScheme == file && explorerResourceIsFolder",
+          "group": "navigation"
+        },
+        {
+          "command": "file-utils.fixPropsType",
+          "when": "resourceScheme == file && !explorerResourceIsFolder && (resourceExtname == .ts || resourceExtname == .tsx)",
           "group": "navigation"
         }
       ]
