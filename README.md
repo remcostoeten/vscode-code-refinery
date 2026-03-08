@@ -16,13 +16,13 @@ Rename files to kebab-case and generate an `index.ts` barrel file exporting all 
   - If the file has exactly 1 type/interface and it is not exported: rename to `Props`.
 
 - **Convert Default Export to Named Export**
-  For `.ts`/`.tsx` files, converts supported default exports to named exports and updates TS/TSX import and re-export sites in the workspace.
+  For `.ts`/`.tsx` files, previews and converts supported default exports to named exports and updates TS/TSX import and re-export sites in the workspace.
 
 - **Convert Named Export to Default Export**
-  For `.ts`/`.tsx` files, converts a single supported named value export to a default export and updates TS/TSX import and re-export sites in the workspace.
+  For `.ts`/`.tsx` files, previews and converts a single supported named value export to a default export and updates TS/TSX import and re-export sites in the workspace.
 
 - **Remove Unused from Current TS/TSX File**
-  Removes unused code from the current file with focused options for:
+  Previews and removes unused code from the current file with focused options for:
   - all
   - imports
   - types/interfaces

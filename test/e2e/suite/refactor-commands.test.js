@@ -40,7 +40,10 @@ async function runWithoutBlockingMessages(callback) {
 
   vscode.window.showInformationMessage = async () => undefined;
   vscode.window.showErrorMessage = async () => undefined;
-  vscode.window.showWarningMessage = async () => undefined;
+  vscode.window.showWarningMessage = async (...args) => {
+    const applyOption = args.find((arg) => arg === 'Apply');
+    return applyOption;
+  };
 
   try {
     return await callback();

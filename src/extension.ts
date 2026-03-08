@@ -36,6 +36,27 @@ async function showCommandSummary(message: string, detailLines: string[] = []) {
   }
 }
 
+async function confirmCommandPreview(message: string, detailLines: string[] = []) {
+  if (detailLines.length === 0) {
+    const action = await vscode.window.showWarningMessage(message, { modal: true }, 'Apply');
+    return action === 'Apply';
+  }
+
+  const channel = getOutputChannel();
+  channel.clear();
+  for (const line of detailLines) {
+    channel.appendLine(line);
+  }
+
+  let action = await vscode.window.showWarningMessage(message, { modal: true }, 'Apply', 'Show details');
+  if (action === 'Show details') {
+    channel.show(true);
+    action = await vscode.window.showWarningMessage(message, { modal: true }, 'Apply');
+  }
+
+  return action === 'Apply';
+}
+
 function toKebabCase(str: string): string {
   return str
     .replace(/([a-z])([A-Z0-9])/g, '$1-$2')
@@ -507,15 +528,15 @@ async function fixPropsType(uri: vscode.Uri) {
   ]);
 }
 
-async function updateWorkspaceReferencesForExportConversion(
+async function collectWorkspaceReferenceUpdatesForExportConversion(
   targetFilePath: string,
   exportName: string,
   mode: 'default-to-named' | 'named-to-default'
-): Promise<{ filesChanged: number; editsApplied: number }> {
-  const channel = getOutputChannel();
+): Promise<{ workspaceEdit: vscode.WorkspaceEdit; changedUris: vscode.Uri[]; filesChanged: number; editsApplied: number; detailLines: string[] }> {
   const files = await findWorkspaceTypeScriptFiles();
   const workspaceEdit = new vscode.WorkspaceEdit();
   const changedUris: vscode.Uri[] = [];
+  const detailLines: string[] = [];
   let filesChanged = 0;
   let editsApplied = 0;
 
@@ -545,20 +566,31 @@ async function updateWorkspaceReferencesForExportConversion(
       );
     }
 
-    channel.appendLine(
+    detailLines.push(
       `[exports] ${path.relative(vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? '', filePath)}: ${rewrites.length} update(s)`
     );
   }
 
-  if (editsApplied > 0) {
-    await vscode.workspace.applyEdit(workspaceEdit);
-    for (const uri of changedUris) {
-      const doc = await vscode.workspace.openTextDocument(uri);
-      await doc.save();
-    }
+  return { workspaceEdit, changedUris, filesChanged, editsApplied, detailLines };
+}
+
+async function applyWorkspaceEditAndSave(workspaceEdit: vscode.WorkspaceEdit, urisToSave: vscode.Uri[]) {
+  const applied = await vscode.workspace.applyEdit(workspaceEdit);
+  if (!applied) {
+    return false;
   }
 
-  return { filesChanged, editsApplied };
+  const seen = new Set<string>();
+  for (const uri of urisToSave) {
+    if (seen.has(uri.toString())) {
+      continue;
+    }
+    seen.add(uri.toString());
+    const doc = await vscode.workspace.openTextDocument(uri);
+    await doc.save();
+  }
+
+  return true;
 }
 
 async function convertDefaultExportToNamed(uri?: vscode.Uri) {
@@ -654,18 +686,35 @@ async function convertDefaultExportToNamed(uri?: vscode.Uri) {
     return;
   }
 
-  const edit = new vscode.WorkspaceEdit();
-  edit.replace(targetUri, new vscode.Range(doc.positionAt(rewrite.start), doc.positionAt(rewrite.end)), rewrite.replacement);
-  const applied = await vscode.workspace.applyEdit(edit);
-  if (!applied) {
-    vscode.window.showErrorMessage('Failed to update the export declaration.');
+  const summary = await collectWorkspaceReferenceUpdatesForExportConversion(doc.uri.fsPath, exportName, 'default-to-named');
+  const detailLines = [
+    `[exports] ${path.basename(doc.uri.fsPath)}: default -> named ${exportName}`,
+    ...summary.detailLines
+  ];
+
+  const shouldApply = await confirmCommandPreview(
+    `Apply default-to-named export conversion for \`${exportName}\` with ${summary.editsApplied} workspace reference update(s)?`,
+    detailLines
+  );
+  if (!shouldApply) {
     return;
   }
 
-  const summary = await updateWorkspaceReferencesForExportConversion(doc.uri.fsPath, exportName, 'default-to-named');
-  await doc.save();
+  summary.workspaceEdit.replace(
+    targetUri,
+    new vscode.Range(doc.positionAt(rewrite.start), doc.positionAt(rewrite.end)),
+    rewrite.replacement
+  );
+
+  const applied = await applyWorkspaceEditAndSave(summary.workspaceEdit, [targetUri, ...summary.changedUris]);
+  if (!applied) {
+    vscode.window.showErrorMessage('Failed to apply the export conversion edits.');
+    return;
+  }
+
   await showCommandSummary(
-    `Converted default export to named export \`${exportName}\`. Updated ${summary.editsApplied} reference(s) in ${summary.filesChanged} file(s).`
+    `Converted default export to named export \`${exportName}\`. Updated ${summary.editsApplied} reference(s) in ${summary.filesChanged} file(s).`,
+    detailLines
   );
 }
 
@@ -769,31 +818,44 @@ async function convertNamedExportToDefault(uri?: vscode.Uri) {
   }
 
   const candidate = candidates[0];
-  const edit = new vscode.WorkspaceEdit();
-  edit.replace(
+  const summary = await collectWorkspaceReferenceUpdatesForExportConversion(doc.uri.fsPath, candidate.exportName, 'named-to-default');
+  const detailLines = [
+    `[exports] ${path.basename(doc.uri.fsPath)}: named ${candidate.exportName} -> default`,
+    ...summary.detailLines
+  ];
+
+  const shouldApply = await confirmCommandPreview(
+    `Apply named-to-default export conversion for \`${candidate.exportName}\` with ${summary.editsApplied} workspace reference update(s)?`,
+    detailLines
+  );
+  if (!shouldApply) {
+    return;
+  }
+
+  summary.workspaceEdit.replace(
     targetUri,
     new vscode.Range(doc.positionAt(candidate.rewrite.start), doc.positionAt(candidate.rewrite.end)),
     candidate.rewrite.replacement
   );
-  const applied = await vscode.workspace.applyEdit(edit);
+
+  const applied = await applyWorkspaceEditAndSave(summary.workspaceEdit, [targetUri, ...summary.changedUris]);
   if (!applied) {
-    vscode.window.showErrorMessage('Failed to update the export declaration.');
+    vscode.window.showErrorMessage('Failed to apply the export conversion edits.');
     return;
   }
 
-  const summary = await updateWorkspaceReferencesForExportConversion(doc.uri.fsPath, candidate.exportName, 'named-to-default');
-  await doc.save();
   await showCommandSummary(
-    `Converted named export \`${candidate.exportName}\` to default export. Updated ${summary.editsApplied} reference(s) in ${summary.filesChanged} file(s).`
+    `Converted named export \`${candidate.exportName}\` to default export. Updated ${summary.editsApplied} reference(s) in ${summary.filesChanged} file(s).`,
+    detailLines
   );
 }
 
-async function removeUnusedExportsFromFile(uri: vscode.Uri): Promise<{ changes: number; details: string[] }> {
+async function collectUnusedExportChanges(uri: vscode.Uri): Promise<{ rewrites: TExportRewrite[]; details: string[] }> {
   const doc = await vscode.workspace.openTextDocument(uri);
   const context = await createTypeScriptLanguageService(uri.fsPath);
   const sourceFile = getSourceFileFromService(context.languageService, uri.fsPath);
   if (!sourceFile) {
-    return { changes: 0, details: [] };
+    return { rewrites: [], details: [] };
   }
 
   const rewrites: TExportRewrite[] = [];
@@ -902,22 +964,22 @@ async function removeUnusedExportsFromFile(uri: vscode.Uri): Promise<{ changes: 
     }
   }
 
+  return { rewrites, details };
+}
+
+async function applyUnusedExportChanges(uri: vscode.Uri, rewrites: TExportRewrite[]) {
   if (rewrites.length === 0) {
-    return { changes: 0, details };
+    return 0;
   }
 
+  const doc = await vscode.workspace.openTextDocument(uri);
   const edit = new vscode.WorkspaceEdit();
   for (const rewrite of rewrites.sort((left, right) => right.start - left.start)) {
     edit.replace(uri, new vscode.Range(doc.positionAt(rewrite.start), doc.positionAt(rewrite.end)), rewrite.replacement);
   }
 
-  const applied = await vscode.workspace.applyEdit(edit);
-  if (!applied) {
-    return { changes: 0, details: [] };
-  }
-
-  await doc.save();
-  return { changes: rewrites.length, details };
+  const applied = await applyWorkspaceEditAndSave(edit, [uri]);
+  return applied ? rewrites.length : 0;
 }
 
 async function removeUnusedFromFile(uri?: vscode.Uri) {
@@ -962,12 +1024,11 @@ async function removeUnusedFromFile(uri?: vscode.Uri) {
     return;
   }
 
-  let appliedFixes = 0;
   const detailLines: string[] = [];
   const tsCategories = selectedCategories.filter((category) => category !== 'exports');
+  const changes: ts.FileTextChanges[] = [];
   if (tsCategories.length > 0) {
     const diagnostics = context.languageService.getSuggestionDiagnostics(doc.uri.fsPath);
-    const changes: ts.FileTextChanges[] = [];
 
     for (const diagnostic of diagnostics) {
       if (diagnostic.start === undefined || !unusedDiagnosticCodes.has(diagnostic.code)) {
@@ -993,25 +1054,40 @@ async function removeUnusedFromFile(uri?: vscode.Uri) {
         detailLines.push(`[unused:${category}] ${path.basename(doc.uri.fsPath)}: ${fix.description}`);
       }
     }
-
-    appliedFixes += await applyTsFileChanges(changes);
   }
 
-  let removedExports = 0;
+  let exportRewrites: TExportRewrite[] = [];
   if (selectedCategories.includes('exports')) {
-    const exportResult = await removeUnusedExportsFromFile(doc.uri);
-    removedExports = exportResult.changes;
+    const exportResult = await collectUnusedExportChanges(doc.uri);
+    exportRewrites = exportResult.rewrites;
     detailLines.push(...exportResult.details);
   }
 
-  const totalChanges = appliedFixes + removedExports;
+  const plannedChanges = changes.reduce((count, fileChange) => count + fileChange.textChanges.length, 0) + exportRewrites.length;
+  const totalChanges = plannedChanges;
   if (totalChanges === 0) {
     vscode.window.showInformationMessage('No matching unused code found to remove.');
     return;
   }
 
+  const shouldApply = await confirmCommandPreview(
+    `Apply unused cleanup with ${totalChanges} planned change(s) in ${path.basename(doc.uri.fsPath)}?`,
+    detailLines
+  );
+  if (!shouldApply) {
+    return;
+  }
+
+  const appliedFixes = await applyTsFileChanges(changes);
+  const removedExports = await applyUnusedExportChanges(doc.uri, exportRewrites);
+  const appliedChanges = appliedFixes + removedExports;
+  if (appliedChanges === 0) {
+    vscode.window.showErrorMessage('Failed to apply the unused cleanup edits.');
+    return;
+  }
+
   await doc.save();
-  await showCommandSummary(`Removed unused code with ${totalChanges} change(s).`, detailLines);
+  await showCommandSummary(`Removed unused code with ${appliedChanges} change(s).`, detailLines);
 }
 
 async function convertInterfacesToTypes(uri?: vscode.Uri) {
