@@ -131,7 +131,9 @@
   },
   "scripts": {
     "compile": "tsc -p .",
-    "test": "npm run compile && node test/refactor-core.test.js",
+    "test:unit": "npm run compile && node test/refactor-core.test.js",
+    "test:e2e": "npm run compile && node test/e2e/run-tests.js",
+    "test": "npm run test:unit && npm run test:e2e",
     "watch": "tsc -watch -p .",
     "lint": "eslint src --ext ts",
     "package": "vsce package",
@@ -141,6 +143,8 @@
   "devDependencies": {
     "@types/node": "^20.4.2",
     "@types/vscode": "^1.80.0",
+    "@vscode/test-electron": "^2.5.2",
+    "mocha": "^11.7.5",
     "typescript": "^5.3.3",
     "vsce": "2.15.0"
   }

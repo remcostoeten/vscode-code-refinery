@@ -346,11 +346,12 @@ export function buildTypeAliasFromInterface(
     : '';
 
   const aliasRightHandSide = heritageTypes ? `${heritageTypes} & ${bodyText}` : bodyText;
+  const exportPrefix = decl.exported ? 'export ' : '';
 
   return {
     start: decl.keywordOffset,
     end: bodyEnd + 1,
-    replacement: `type ${replacementName}${typeParams} = ${aliasRightHandSide};`
+    replacement: `${exportPrefix}type ${replacementName}${typeParams} = ${aliasRightHandSide};`
   };
 }
 

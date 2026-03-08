@@ -498,6 +498,7 @@ async function updateWorkspaceReferencesForExportConversion(
   const channel = getOutputChannel();
   const files = await findWorkspaceTypeScriptFiles();
   const workspaceEdit = new vscode.WorkspaceEdit();
+  const changedUris: vscode.Uri[] = [];
   let filesChanged = 0;
   let editsApplied = 0;
 
@@ -517,6 +518,7 @@ async function updateWorkspaceReferencesForExportConversion(
 
     filesChanged++;
     editsApplied += rewrites.length;
+    changedUris.push(uri);
 
     for (const rewrite of rewrites.sort((left, right) => right.start - left.start)) {
       workspaceEdit.replace(
@@ -533,6 +535,10 @@ async function updateWorkspaceReferencesForExportConversion(
 
   if (editsApplied > 0) {
     await vscode.workspace.applyEdit(workspaceEdit);
+    for (const uri of changedUris) {
+      const doc = await vscode.workspace.openTextDocument(uri);
+      await doc.save();
+    }
   }
 
   return { filesChanged, editsApplied };
