@@ -21,6 +21,21 @@ function getOutputChannel(): vscode.OutputChannel {
   return outputChannel;
 }
 
+async function showCommandSummary(message: string, detailLines: string[] = []) {
+  const channel = getOutputChannel();
+  if (detailLines.length > 0) {
+    channel.clear();
+    for (const line of detailLines) {
+      channel.appendLine(line);
+    }
+  }
+
+  const action = await vscode.window.showInformationMessage(message, ...(detailLines.length > 0 ? ['Show details'] : []));
+  if (action === 'Show details') {
+    channel.show(true);
+  }
+}
+
 function toKebabCase(str: string): string {
   return str
     .replace(/([a-z])([A-Z0-9])/g, '$1-$2')
@@ -487,7 +502,9 @@ async function fixPropsType(uri: vscode.Uri) {
   }
 
   await doc.save();
-  vscode.window.showInformationMessage(`Renamed ${target.name} to Props as a type.`);
+  await showCommandSummary(`Renamed ${target.name} to Props as a type.`, [
+    `[props] ${path.basename(uri.fsPath)}: ${target.kind} ${target.name} -> type Props`
+  ]);
 }
 
 async function updateWorkspaceReferencesForExportConversion(
@@ -647,14 +664,9 @@ async function convertDefaultExportToNamed(uri?: vscode.Uri) {
 
   const summary = await updateWorkspaceReferencesForExportConversion(doc.uri.fsPath, exportName, 'default-to-named');
   await doc.save();
-
-  const action = await vscode.window.showInformationMessage(
-    `Converted default export to named export \`${exportName}\`. Updated ${summary.editsApplied} reference(s) in ${summary.filesChanged} file(s).`,
-    'Show details'
+  await showCommandSummary(
+    `Converted default export to named export \`${exportName}\`. Updated ${summary.editsApplied} reference(s) in ${summary.filesChanged} file(s).`
   );
-  if (action === 'Show details') {
-    getOutputChannel().show(true);
-  }
 }
 
 async function convertNamedExportToDefault(uri?: vscode.Uri) {
@@ -771,25 +783,21 @@ async function convertNamedExportToDefault(uri?: vscode.Uri) {
 
   const summary = await updateWorkspaceReferencesForExportConversion(doc.uri.fsPath, candidate.exportName, 'named-to-default');
   await doc.save();
-
-  const action = await vscode.window.showInformationMessage(
-    `Converted named export \`${candidate.exportName}\` to default export. Updated ${summary.editsApplied} reference(s) in ${summary.filesChanged} file(s).`,
-    'Show details'
+  await showCommandSummary(
+    `Converted named export \`${candidate.exportName}\` to default export. Updated ${summary.editsApplied} reference(s) in ${summary.filesChanged} file(s).`
   );
-  if (action === 'Show details') {
-    getOutputChannel().show(true);
-  }
 }
 
-async function removeUnusedExportsFromFile(uri: vscode.Uri): Promise<number> {
+async function removeUnusedExportsFromFile(uri: vscode.Uri): Promise<{ changes: number; details: string[] }> {
   const doc = await vscode.workspace.openTextDocument(uri);
   const context = await createTypeScriptLanguageService(uri.fsPath);
   const sourceFile = getSourceFileFromService(context.languageService, uri.fsPath);
   if (!sourceFile) {
-    return 0;
+    return { changes: 0, details: [] };
   }
 
   const rewrites: TExportRewrite[] = [];
+  const details: string[] = [];
 
   for (const statement of sourceFile.statements) {
     if (
@@ -808,10 +816,12 @@ async function removeUnusedExportsFromFile(uri: vscode.Uri): Promise<number> {
       if (usage.local === 0) {
         const range = getDeletionRange(sourceFile, statement);
         rewrites.push({ start: range.start, end: range.end, replacement: '' });
+        details.push(`[unused:exports] ${path.basename(uri.fsPath)}: removed export ${statement.name.text}`);
       } else {
         const range = getExportModifierRemovalRange(sourceFile, statement);
         if (range) {
           rewrites.push({ start: range.start, end: range.end, replacement: '' });
+          details.push(`[unused:exports] ${path.basename(uri.fsPath)}: removed export modifier from ${statement.name.text}`);
         }
       }
       continue;
@@ -835,10 +845,12 @@ async function removeUnusedExportsFromFile(uri: vscode.Uri): Promise<number> {
       if (usage.local === 0) {
         const range = getDeletionRange(sourceFile, statement);
         rewrites.push({ start: range.start, end: range.end, replacement: '' });
+        details.push(`[unused:exports] ${path.basename(uri.fsPath)}: removed export ${declaration.name.text}`);
       } else {
         const range = getExportModifierRemovalRange(sourceFile, statement);
         if (range) {
           rewrites.push({ start: range.start, end: range.end, replacement: '' });
+          details.push(`[unused:exports] ${path.basename(uri.fsPath)}: removed export modifier from ${declaration.name.text}`);
         }
       }
       continue;
@@ -866,12 +878,14 @@ async function removeUnusedExportsFromFile(uri: vscode.Uri): Promise<number> {
       if (kept.length === 0) {
         const range = getDeletionRange(sourceFile, statement);
         rewrites.push({ start: range.start, end: range.end, replacement: '' });
+        details.push(`[unused:exports] ${path.basename(uri.fsPath)}: removed export list`);
       } else {
         rewrites.push({
           start: statement.getStart(sourceFile),
           end: statement.getEnd(),
           replacement: buildExportDeclarationText(sourceFile, statement, kept.map((element) => element.getText(sourceFile)))
         });
+        details.push(`[unused:exports] ${path.basename(uri.fsPath)}: pruned export list`);
       }
       continue;
     }
@@ -884,11 +898,12 @@ async function removeUnusedExportsFromFile(uri: vscode.Uri): Promise<number> {
 
       const range = getDeletionRange(sourceFile, statement);
       rewrites.push({ start: range.start, end: range.end, replacement: '' });
+      details.push(`[unused:exports] ${path.basename(uri.fsPath)}: removed default export ${statement.expression.text}`);
     }
   }
 
   if (rewrites.length === 0) {
-    return 0;
+    return { changes: 0, details };
   }
 
   const edit = new vscode.WorkspaceEdit();
@@ -898,11 +913,11 @@ async function removeUnusedExportsFromFile(uri: vscode.Uri): Promise<number> {
 
   const applied = await vscode.workspace.applyEdit(edit);
   if (!applied) {
-    return 0;
+    return { changes: 0, details: [] };
   }
 
   await doc.save();
-  return rewrites.length;
+  return { changes: rewrites.length, details };
 }
 
 async function removeUnusedFromFile(uri?: vscode.Uri) {
@@ -948,6 +963,7 @@ async function removeUnusedFromFile(uri?: vscode.Uri) {
   }
 
   let appliedFixes = 0;
+  const detailLines: string[] = [];
   const tsCategories = selectedCategories.filter((category) => category !== 'exports');
   if (tsCategories.length > 0) {
     const diagnostics = context.languageService.getSuggestionDiagnostics(doc.uri.fsPath);
@@ -974,6 +990,7 @@ async function removeUnusedFromFile(uri?: vscode.Uri) {
       const fix = fixes.find((candidate) => candidate.changes.length > 0);
       if (fix) {
         changes.push(...fix.changes);
+        detailLines.push(`[unused:${category}] ${path.basename(doc.uri.fsPath)}: ${fix.description}`);
       }
     }
 
@@ -982,7 +999,9 @@ async function removeUnusedFromFile(uri?: vscode.Uri) {
 
   let removedExports = 0;
   if (selectedCategories.includes('exports')) {
-    removedExports = await removeUnusedExportsFromFile(doc.uri);
+    const exportResult = await removeUnusedExportsFromFile(doc.uri);
+    removedExports = exportResult.changes;
+    detailLines.push(...exportResult.details);
   }
 
   const totalChanges = appliedFixes + removedExports;
@@ -992,7 +1011,7 @@ async function removeUnusedFromFile(uri?: vscode.Uri) {
   }
 
   await doc.save();
-  vscode.window.showInformationMessage(`Removed unused code with ${totalChanges} change(s).`);
+  await showCommandSummary(`Removed unused code with ${totalChanges} change(s).`, detailLines);
 }
 
 async function convertInterfacesToTypes(uri?: vscode.Uri) {
@@ -1052,7 +1071,10 @@ async function convertInterfacesToTypes(uri?: vscode.Uri) {
   }
 
   await doc.save();
-  vscode.window.showInformationMessage(`Converted ${conversions.length} interface(s) to type aliases.`);
+  await showCommandSummary(
+    `Converted ${conversions.length} interface(s) to type aliases.`,
+    conversions.map((conversion) => `[interfaces] ${path.basename(doc.uri.fsPath)}: ${conversion.replacement}`)
+  );
 }
 
 async function updateImportsForRename(oldUri: vscode.Uri, newUri: vscode.Uri, token: vscode.CancellationToken) {
