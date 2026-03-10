@@ -1,77 +1,250 @@
-# VSCode Personal Utilities
+# Code Refinery
 
-Rename files to kebab-case and generate an `index.ts` barrel file exporting all `.ts`/`.tsx` files in a directory.
+VS Code extension for small TypeScript/TSX refactors and file-structure cleanup.
 
----
+## What It Does
+
+This extension currently ships 7 explorer commands:
+
+1. `Convert Filename to kebab-case`
+2. `Generate index.ts with exports`
+3. `Rename Local Type/Interface to Props`
+4. `Convert Default Export to Named Export`
+5. `Convert Named Export to Default Export`
+6. `Remove Unused from Current TS/TSX File`
+7. `Convert Interfaces to Types`
 
 ## Features
 
-- **Convert Filename to kebab-case**
-  Rename the selected file (or multiple selected files) from `thisCaseName` or `ThisCaseName` to `this-case-name`.
-  When enabled, the extension also updates relative import specifiers in your workspace that reference the renamed file.
+### Convert Filename to kebab-case
 
-- **Rename Local Type/Interface to Props**
-  For `.ts`/`.tsx` files, renames a single local (non-exported) `type`/`interface` to `Props`.
-  If the local declaration is an `interface`, it is converted to `type Props = ...`:
-  - If the file has exactly 1 type/interface and it is not exported: rename to `Props`.
+- Renames one file or a multi-selection of files to kebab-case.
+- Skips files that are already kebab-case.
+- Skips renames when the target file already exists.
+- Runs in a cancellable progress notification for batch operations.
+- Can reveal the renamed file in the Explorer.
+- Can update relative import specifiers across workspace source files after the rename.
+- Import updates cover `from '...'`, `require('...')`, and dynamic `import('...')` references.
+- Import update scanning covers `ts`, `tsx`, `js`, `jsx`, `mts`, `cts`, `mjs`, and `cjs` files.
 
-- **Convert Default Export to Named Export**
-  For `.ts`/`.tsx` files, previews and converts supported default exports to named exports and updates TS/TSX import and re-export sites in the workspace.
+### Generate `index.ts` with exports
 
-- **Convert Named Export to Default Export**
-  For `.ts`/`.tsx` files, previews and converts a single supported named value export to a default export and updates TS/TSX import and re-export sites in the workspace.
+- Works on a selected folder from the Explorer.
+- Generates barrel exports for sibling `.ts` and `.tsx` files.
+- Sorts export lines alphabetically.
+- Skips:
+  `index.ts`, `index.tsx`, `.d.ts`, `*.test.ts`, `*.spec.ts`, `*.stories.ts`, and TSX variants.
+- Detects when `index.ts` is already up to date.
+- Prompts before overwriting an existing `index.ts`.
+- Opens the generated file after writing.
 
-- **Remove Unused from Current TS/TSX File**
-  Previews and removes unused code from the current file with focused options for:
-  - all
-  - imports
-  - types/interfaces
-  - exports
-  - functions
-  - variables
+### Rename Local Type/Interface to `Props`
 
-- **Convert Interfaces to Types**
-  Converts top-level interfaces to type aliases where safe. It skips merged interfaces and default-exported interfaces.
+- Runs only on `.ts` and `.tsx` files.
+- Uses the TypeScript rename provider, so references in the file/workspace are updated through TS tooling.
+- Intended for React-style component files where a local props shape has a custom name like `ButtonProps`, `CardInput`, or `WidgetOptions`, but you want the file standardized to `Props`.
+- Only runs when the file contains exactly one top-level type-like declaration and it is not exported.
+- Refuses to run if `Props` already exists.
+- If the target is an `interface`, it renames it and converts it to `type Props = ...`.
 
-- **Generate index.ts Barrel File**
-  Create an `index.ts` file exporting all `.ts` and `.tsx` files in the selected folder:
+Example:
 
-  ```ts
-  export * from './filename';
-  ```
+```tsx
+interface ButtonProps {
+    label: string
+}
+
+export function Button(props: ButtonProps) {
+    return <button>{props.label}</button>
+}
+```
+
+becomes:
+
+```tsx
+type Props = {
+    label: string
+}
+
+export function Button(props: Props) {
+    return <button>{props.label}</button>
+}
+```
+
+This is useful when you prefer a consistent `Props` convention inside component files instead of repeating file-specific prop type names everywhere.
+
+### Convert Default Export to Named Export
+
+- Runs only on `.ts` and `.tsx` files.
+- Previews the file/workspace changes before applying them.
+- Updates workspace import and re-export sites that reference the file.
+- Useful when you want a file to follow named-export conventions across a codebase.
+- Supports:
+  `export default function Named() {}`
+- Supports:
+  `export default class Named {}`
+- Supports:
+  `export default Foo`
+- Supports:
+  `export { Foo as default }`
+
+### Convert Named Export to Default Export
+
+- Runs only on `.ts` and `.tsx` files.
+- Previews the file/workspace changes before applying them.
+- Updates workspace import and re-export sites that reference the file.
+- Only runs when the file has exactly one supported named value export with no ambiguity.
+- Supports named exported functions, classes, single exported variables, and single-item local export lists.
+
+Example:
+
+```ts
+export function Widget() {}
+```
+
+with imports like:
+
+```ts
+import { Widget } from './widget'
+```
+
+becomes:
+
+```ts
+export default function Widget() {}
+```
+
+and workspace imports are rewritten to:
+
+```ts
+import Widget from './widget'
+```
+
+### Remove Unused from Current TS/TSX File
+
+- Runs only on `.ts` and `.tsx` files.
+- Uses TypeScript diagnostics/code fixes for unused cleanup.
+- Shows a preview before edits are applied.
+- Lets you target one category at a time or clean everything.
+- Supported cleanup scopes:
+  `All`, `Imports`, `Types/Interfaces`, `Exports`, `Functions`, `Variables`
+- Export cleanup also removes unused exported declarations or strips the `export` modifier when the symbol is only used locally.
+
+This is meant for focused cleanup of the current file instead of running a project-wide linter autofix and hoping it does the right thing.
+
+### Convert Interfaces to Types
+
+- Runs only on `.ts` and `.tsx` files.
+- Converts safe top-level `interface` declarations to `type` aliases.
+- Preserves `export` when present.
+- Skips merged interfaces.
+- Skips default-exported interfaces.
+- Converts every safe interface in the selected file in one pass.
+
+Example:
+
+```ts
+export interface User {
+    id: string
+    name: string
+}
+```
+
+becomes:
+
+```ts
+export type User = {
+    id: string
+    name: string
+}
+```
 
 ## Settings
 
-- `codeRefinery.rename.updateImports`: Update TS/JS relative import specifiers after renaming files (default: `true`).
-- `codeRefinery.rename.showSummary`: Show a summary message after batch renames (default: `true`).
-- `codeRefinery.rename.revealInExplorer`: Reveal the renamed file in the Explorer (default: `true`).
+The extension contributes 3 settings:
 
-## Usage
+- `codeRefinery.rename.updateImports`
+  Update TS/JS relative import specifiers in the workspace after file rename.
+  Default: `true`
+- `codeRefinery.rename.showSummary`
+  Show a rename summary after batch operations.
+  Default: `true`
+- `codeRefinery.rename.revealInExplorer`
+  Reveal the renamed file in the Explorer after rename.
+  Default: `true`
 
-You can trigger commands via:
+## Where Commands Appear
 
-- Right-click context menu on files or folders in the Explorer.
+- Explorer context menu on files:
+  `Convert Filename to kebab-case`
+- Explorer context menu on folders:
+  `Generate index.ts with exports`
+- Explorer context menu on `.ts` / `.tsx` files:
+  `Rename Local Type/Interface to Props`
+  `Convert Default Export to Named Export`
+  `Convert Named Export to Default Export`
+  `Remove Unused from Current TS/TSX File`
+  `Convert Interfaces to Types`
+- Command Palette:
+  all contributed commands are available by title
 
-- Keyboard shortcuts:
-  - Rename file to kebab-case: `Ctrl+Alt+K`
-  - Generate index.ts: `Ctrl+Alt+I`
+## Keybindings
 
-- Command Palette (`Cmd+P` or `Ctrl+P`), search:
-  - Convert Filename to kebab-case
-  - Generate index.ts with exports
-  - Rename Local Type/Interface to Props
-  - Convert Default Export to Named Export
-  - Convert Named Export to Default Export
-  - Remove Unused from Current TS/TSX File
-  - Convert Interfaces to Types
+- `Ctrl+Alt+K`
+  Convert filename to kebab-case
+- `Ctrl+Alt+I`
+  Generate `index.ts` with exports
 
-## Installation
+## Development
 
-Clone the repo or download the extension folder, then:
+### Requirements
+
+- Node.js
+- npm
+- VS Code
+
+### Scripts
+
+- `npm run compile`
+  Compile the extension
+- `npm run watch`
+  Watch and compile on changes
+- `npm run lint`
+  Lint with `oxlint`
+- `npm run format`
+  Format with `oxfmt`
+- `npm run format:check`
+  Check formatting without writing files
+- `npm run test:unit`
+  Run unit tests
+- `npm run test:e2e`
+  Run VS Code integration tests
+- `npm run test`
+  Run unit and E2E suites
+- `npm run package`
+  Build a `.vsix`
+
+### Local Run
 
 ```bash
 npm install
 npm run compile
 ```
 
-Open the folder in VSCode, press `F5` to launch the extension development host, and test commands. Or press `Ctrl+Shift+P` and search for the install extension from location option.
+Open the folder in VS Code and press `F5` to launch the Extension Development Host.
+
+## Install the VSIX Manually
+
+Build the package:
+
+```bash
+npm run package
+```
+
+That produces:
+
+```text
+code-refinery-0.10.0.vsix
+```
+
+Install it in VS Code with `Extensions: Install from VSIX...` and select the generated file.

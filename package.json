@@ -135,7 +135,9 @@
     "test:e2e": "npm run compile && node test/e2e/run-tests.js",
     "test": "npm run test:unit && npm run test:e2e",
     "watch": "tsc -watch -p .",
-    "lint": "eslint src --ext ts",
+    "lint": "oxlint src test scripts --ignore-pattern 'test/e2e/fixture-workspace/**' --fix",
+    "format": "oxfmt --write src test scripts",
+    "format:check": "oxfmt --check src test scripts",
     "package": "vsce package",
     "publish": "vsce publish",
     "release": "node scripts/release.js"
@@ -145,7 +147,9 @@
     "@types/vscode": "^1.80.0",
     "@vscode/test-electron": "^2.5.2",
     "mocha": "^11.7.5",
-    "typescript": "^5.3.3",
+    "oxfmt": "^0.37.0",
+    "oxlint": "^1.52.0",
+    "typescript": "^5.9.3",
     "vsce": "2.15.0"
   }
 }

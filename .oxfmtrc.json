@@ -1,0 +1,8 @@
+{
+    "semi": false,
+    "trailingComma": "none",
+    "useTabs": false,
+    "tabWidth": 4,
+    "endOfLine": "lf",
+    "ignorePatterns": ["dist", "node_modules", ".vscode-test"]
+}
