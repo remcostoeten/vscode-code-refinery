@@ -14,6 +14,12 @@ export type TExportRewrite = {
     replacement: string
 }
 
+export type TBarrelImportRewritePlan = {
+    sourceModule: string
+    barrelModule: string
+    exportedNames: string[]
+}
+
 export function getTopLevelTypeLikeDecls(text: string): TTypeLikeDecl[] {
     const decls: TTypeLikeDecl[] = []
     const exportedNames = new Set<string>()
@@ -365,16 +371,14 @@ export function createSourceFile(filePath: string, text: string): ts.SourceFile 
     )
 }
 
-function buildImportDeclarationText(
-    sourceFile: ts.SourceFile,
-    node: ts.ImportDeclaration,
+function buildImportDeclarationTextFromModuleText(
+    moduleText: string,
     options: {
         defaultImport?: string
         namedImports?: string[]
         isTypeOnly?: boolean
     }
 ): string {
-    const moduleText = node.moduleSpecifier.getText(sourceFile)
     const pieces: string[] = ["import"]
 
     if (options.isTypeOnly) {
@@ -395,6 +399,21 @@ function buildImportDeclarationText(
 
     pieces.push("from", moduleText)
     return `${pieces.join(" ")};`
+}
+
+function buildImportDeclarationText(
+    sourceFile: ts.SourceFile,
+    node: ts.ImportDeclaration,
+    options: {
+        defaultImport?: string
+        namedImports?: string[]
+        isTypeOnly?: boolean
+    }
+): string {
+    return buildImportDeclarationTextFromModuleText(
+        node.moduleSpecifier.getText(sourceFile),
+        options
+    )
 }
 
 export function buildExportDeclarationText(
@@ -584,6 +603,212 @@ export function collectNamedToDefaultReferenceRewrites(
                 replacement: buildExportDeclarationText(sourceFile, statement, specifiers)
             })
         }
+    }
+
+    return rewrites
+}
+
+function normalizeNamedSpecifierText(text: string): string {
+    return text.replace(/\s+/g, " ").trim()
+}
+
+function sortNamedSpecifierTexts(specifiers: Iterable<string>): string[] {
+    return Array.from(new Set(Array.from(specifiers).map(normalizeNamedSpecifierText))).sort(
+        (left, right) => left.localeCompare(right)
+    )
+}
+
+export function collectBarrelImportConsolidationRewrites(
+    sourceFile: ts.SourceFile,
+    plans: TBarrelImportRewritePlan[]
+): TExportRewrite[] {
+    const fullText = sourceFile.getFullText()
+    const planBySourceModule = new Map<string, TBarrelImportRewritePlan>()
+    for (const plan of plans) {
+        const existing = planBySourceModule.get(plan.sourceModule)
+        if (!existing) {
+            planBySourceModule.set(plan.sourceModule, {
+                sourceModule: plan.sourceModule,
+                barrelModule: plan.barrelModule,
+                exportedNames: [...plan.exportedNames]
+            })
+            continue
+        }
+
+        existing.exportedNames = Array.from(
+            new Set([...existing.exportedNames, ...plan.exportedNames])
+        )
+    }
+
+    const rewrites: TExportRewrite[] = []
+    const groupedNamedSpecifiers = new Map<string, Set<string>>()
+    const existingBarrelImports = new Map<
+        string,
+        {
+            node: ts.ImportDeclaration
+            defaultImport?: string
+            namedImports: string[]
+        }
+    >()
+
+    for (const statement of sourceFile.statements) {
+        if (!ts.isImportDeclaration(statement) || !ts.isStringLiteral(statement.moduleSpecifier)) {
+            continue
+        }
+
+        const specifierText = statement.moduleSpecifier.text
+        const clause = statement.importClause
+        if (!clause) {
+            continue
+        }
+
+        const barrelKey = `${clause.isTypeOnly ? "type" : "value"}:${specifierText}`
+        if (
+            clause.namedBindings &&
+            ts.isNamedImports(clause.namedBindings) &&
+            !existingBarrelImports.has(barrelKey)
+        ) {
+            existingBarrelImports.set(barrelKey, {
+                node: statement,
+                defaultImport: clause.name?.text,
+                namedImports: clause.namedBindings.elements.map((element) =>
+                    element.getText(sourceFile)
+                )
+            })
+        }
+
+        const plan = planBySourceModule.get(specifierText)
+        if (!plan) {
+            continue
+        }
+
+        if (clause.namedBindings && ts.isNamespaceImport(clause.namedBindings)) {
+            continue
+        }
+
+        const exportedNames = new Set(plan.exportedNames)
+        const movedNamedSpecifiers: string[] = []
+        let remainingDefaultImport = clause.name?.text
+        const remainingNamedSpecifiers: string[] = []
+
+        if (clause.name) {
+            let exportedName: string | undefined
+            if (exportedNames.has(clause.name.text)) {
+                exportedName = clause.name.text
+            } else if (!clause.namedBindings && exportedNames.size === 1) {
+                exportedName = Array.from(exportedNames)[0]
+            }
+
+            if (exportedName) {
+                movedNamedSpecifiers.push(
+                    exportedName === clause.name.text
+                        ? exportedName
+                        : `${exportedName} as ${clause.name.text}`
+                )
+                remainingDefaultImport = undefined
+            }
+        }
+
+        if (clause.namedBindings && ts.isNamedImports(clause.namedBindings)) {
+            for (const element of clause.namedBindings.elements) {
+                const importedName = element.propertyName?.text ?? element.name.text
+                if (exportedNames.has(importedName)) {
+                    movedNamedSpecifiers.push(element.getText(sourceFile))
+                } else {
+                    remainingNamedSpecifiers.push(element.getText(sourceFile))
+                }
+            }
+        }
+
+        if (movedNamedSpecifiers.length === 0) {
+            continue
+        }
+
+        const groupKey = `${clause.isTypeOnly ? "type" : "value"}:${plan.barrelModule}`
+        const existingGroup = groupedNamedSpecifiers.get(groupKey)
+        if (existingGroup) {
+            for (const specifier of movedNamedSpecifiers) {
+                existingGroup.add(normalizeNamedSpecifierText(specifier))
+            }
+        } else {
+            groupedNamedSpecifiers.set(
+                groupKey,
+                new Set(movedNamedSpecifiers.map(normalizeNamedSpecifierText))
+            )
+        }
+
+        const replacement =
+            !remainingDefaultImport && remainingNamedSpecifiers.length === 0
+                ? ""
+                : buildImportDeclarationText(sourceFile, statement, {
+                      defaultImport: remainingDefaultImport,
+                      namedImports:
+                          remainingNamedSpecifiers.length > 0
+                              ? sortNamedSpecifierTexts(remainingNamedSpecifiers)
+                              : undefined,
+                      isTypeOnly: clause.isTypeOnly
+                  })
+
+        if (replacement === "") {
+            let end = statement.getEnd()
+            while (end < fullText.length && /[\r\n]/.test(fullText[end])) {
+                end++
+            }
+            rewrites.push({
+                start: statement.getStart(sourceFile),
+                end,
+                replacement
+            })
+        } else {
+            rewrites.push({
+                start: statement.getStart(sourceFile),
+                end: statement.getEnd(),
+                replacement
+            })
+        }
+    }
+
+    const newImports: string[] = []
+    for (const [groupKey, namedSpecifiers] of groupedNamedSpecifiers) {
+        const [, barrelModule] = groupKey.split(":")
+        const isTypeOnly = groupKey.startsWith("type:")
+        const existing = existingBarrelImports.get(groupKey)
+        const mergedNamedImports = sortNamedSpecifierTexts([
+            ...(existing?.namedImports ?? []),
+            ...namedSpecifiers
+        ])
+
+        if (existing) {
+            rewrites.push({
+                start: existing.node.getStart(sourceFile),
+                end: existing.node.getEnd(),
+                replacement: buildImportDeclarationText(sourceFile, existing.node, {
+                    defaultImport: existing.defaultImport,
+                    namedImports: mergedNamedImports,
+                    isTypeOnly
+                })
+            })
+        } else {
+            newImports.push(
+                buildImportDeclarationTextFromModuleText(`'${barrelModule}'`, {
+                    namedImports: mergedNamedImports,
+                    isTypeOnly
+                })
+            )
+        }
+    }
+
+    if (newImports.length > 0) {
+        const importStatements = sourceFile.statements.filter(ts.isImportDeclaration)
+        const insertPos =
+            importStatements.length > 0 ? importStatements[importStatements.length - 1].getEnd() : 0
+        const separator =
+            importStatements.length > 0 ? "\n" : sourceFile.statements.length > 0 ? "\n\n" : "\n"
+        rewrites.push({
+            start: insertPos,
+            end: insertPos,
+            replacement: `${insertPos === 0 ? "" : "\n"}${newImports.sort((left, right) => left.localeCompare(right)).join("\n")}${separator}`
+        })
     }
 
     return rewrites

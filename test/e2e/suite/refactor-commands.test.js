@@ -10,6 +10,7 @@ function sleep(ms) {
 async function writeWorkspaceFile(relativePath, content) {
     const workspaceRoot = vscode.workspace.workspaceFolders[0].uri.fsPath
     const uri = vscode.Uri.file(path.join(workspaceRoot, relativePath))
+    await vscode.workspace.fs.createDirectory(vscode.Uri.file(path.dirname(uri.fsPath)))
     await vscode.workspace.fs.writeFile(uri, Buffer.from(content, "utf8"))
     return uri
 }
@@ -37,12 +38,41 @@ async function runWithoutBlockingMessages(callback) {
     const originalInfo = vscode.window.showInformationMessage
     const originalError = vscode.window.showErrorMessage
     const originalWarning = vscode.window.showWarningMessage
+    const originalQuickPick = vscode.window.showQuickPick
 
     vscode.window.showInformationMessage = async () => undefined
     vscode.window.showErrorMessage = async () => undefined
     vscode.window.showWarningMessage = async (...args) => {
         const applyOption = args.find((arg) => arg === "Apply")
         return applyOption
+    }
+    vscode.window.showQuickPick = async (items) => items[0]
+
+    try {
+        return await callback()
+    } finally {
+        vscode.window.showInformationMessage = originalInfo
+        vscode.window.showErrorMessage = originalError
+        vscode.window.showWarningMessage = originalWarning
+        vscode.window.showQuickPick = originalQuickPick
+    }
+}
+
+async function runWithMockedUi(callback, options = {}) {
+    const originalInfo = vscode.window.showInformationMessage
+    const originalError = vscode.window.showErrorMessage
+    const originalWarning = vscode.window.showWarningMessage
+    const originalQuickPick = vscode.window.showQuickPick
+
+    vscode.window.showInformationMessage = async () => undefined
+    vscode.window.showErrorMessage = async () => undefined
+    vscode.window.showWarningMessage = async (...args) => {
+        const applyOption = args.find((arg) => arg === "Apply")
+        return applyOption
+    }
+    vscode.window.showQuickPick = async (items) => {
+        const matcher = options.quickPickLabel
+        return items.find((item) => item.label === matcher) ?? items[0]
     }
 
     try {
@@ -51,6 +81,7 @@ async function runWithoutBlockingMessages(callback) {
         vscode.window.showInformationMessage = originalInfo
         vscode.window.showErrorMessage = originalError
         vscode.window.showWarningMessage = originalWarning
+        vscode.window.showQuickPick = originalQuickPick
     }
 }
 
@@ -155,5 +186,68 @@ describe("Refactor commands", () => {
         const updated = await readWorkspaceFile("interfaces.ts")
         assert.match(updated, /export type PublicThing = \{\n  id: string;\n\};/)
         assert.match(updated, /type LocalThing = PublicThing & \{\n  name: string;\n\};/)
+    })
+
+    it("consolidateBarrelImports merges only symbols exported by the barrel", async () => {
+        const folderUri = vscode.Uri.file(
+            path.join(vscode.workspace.workspaceFolders[0].uri.fsPath, "components/ui")
+        )
+
+        await writeWorkspaceFile(
+            "components/ui/button.ts",
+            `export function Button() {\n  return 1;\n}\n`
+        )
+        await writeWorkspaceFile(
+            "components/ui/label.ts",
+            `export function Label() {\n  return 1;\n}\n`
+        )
+        await writeWorkspaceFile(
+            "components/ui/card.ts",
+            `export function Card() {\n  return 1;\n}\n`
+        )
+        await writeWorkspaceFile(
+            "components/ui/index.ts",
+            `export { Button } from './button';\nexport { Label } from './label';\n`
+        )
+        await writeWorkspaceFile(
+            "barrel-consumer.tsx",
+            `import { Button } from '@/components/ui/button';\nimport { Label as FieldLabel } from '@/components/ui/label';\nimport { Card } from '@/components/ui/card';\n\nexport const items = [Button, FieldLabel, Card];\n`
+        )
+
+        await openFile("barrel-consumer.tsx")
+        await sleep(1200)
+        await runWithMockedUi(
+            () => vscode.commands.executeCommand("file-utils.consolidateBarrelImports", folderUri),
+            { quickPickLabel: "Current file" }
+        )
+        await sleep(500)
+
+        const updated = await readWorkspaceFile("barrel-consumer.tsx")
+        assert.match(updated, /import \{ Button, Label as FieldLabel \} from '@\/components\/ui';/)
+        assert.match(updated, /import \{ Card \} from '@\/components\/ui\/card';/)
+        assert.doesNotMatch(updated, /from '@\/components\/ui\/button';/)
+        assert.doesNotMatch(updated, /from '@\/components\/ui\/label';/)
+    })
+
+    it("consolidateBarrelImports ignores folders outside the allowed UI paths", async () => {
+        const folderUri = vscode.Uri.file(
+            path.join(vscode.workspace.workspaceFolders[0].uri.fsPath, "lib/ui")
+        )
+
+        await writeWorkspaceFile("lib/ui/button.ts", `export function Button() {\n  return 1;\n}\n`)
+        await writeWorkspaceFile("lib/ui/index.ts", `export { Button } from './button';\n`)
+        const original = `import { Button } from '@/lib/ui/button';\n\nexport const items = [Button];\n`
+        await writeWorkspaceFile("barrel-disallowed.tsx", original)
+
+        await openFile("barrel-disallowed.tsx")
+        await sleep(1200)
+        await runWithMockedUi(
+            () => vscode.commands.executeCommand("file-utils.consolidateBarrelImports", folderUri),
+            { quickPickLabel: "Current file" }
+        )
+        await sleep(300)
+
+        const updated = await readWorkspaceFile("barrel-disallowed.tsx")
+        assert.equal(updated, original)
     })
 })

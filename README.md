@@ -1,18 +1,20 @@
 # Code Refinery
 
-VS Code extension for small TypeScript/TSX refactors and file-structure cleanup.
+TypeScript refactors for imports, barrels, props, exports, and cleanup in VS Code.
 
 ## What It Does
 
-This extension currently ships 7 explorer commands:
+This extension currently ships 9 commands:
 
 1. `Convert Filename to kebab-case`
 2. `Generate index.ts with exports`
-3. `Rename Local Type/Interface to Props`
-4. `Convert Default Export to Named Export`
-5. `Convert Named Export to Default Export`
-6. `Remove Unused from Current TS/TSX File`
-7. `Convert Interfaces to Types`
+3. `Consolidate Imports via Folder Barrel`
+4. `Consolidate Current File Imports to Detected UI Barrel`
+5. `Rename Local Type/Interface to Props`
+6. `Convert Default Export to Named Export`
+7. `Convert Named Export to Default Export`
+8. `Remove Unused from Current TS/TSX File`
+9. `Convert Interfaces to Types`
 
 ## Features
 
@@ -37,6 +39,55 @@ This extension currently ships 7 explorer commands:
 - Detects when `index.ts` is already up to date.
 - Prompts before overwriting an existing `index.ts`.
 - Opens the generated file after writing.
+
+### Consolidate Imports via Folder Barrel
+
+- Works on a selected folder that contains `index.ts` or `index.tsx`.
+- Runs only for configured UI-folder paths such as `components/ui`, `crc/components/ui`, `shared/ui`, `src/shared/ui`, or `src/shared/components/ui`.
+- Prompts for `Current file` or `Workspace` scope.
+- The default scope can be configured so you do not have to choose every time.
+- Scans imports that target files inside that folder and rewrites them to import from the folder barrel instead.
+- Only moves symbols that are actually exported by the folder barrel.
+- Leaves non-barreled imports untouched when the symbol is not exported from `index.ts`.
+- Ignores anything under `node_modules`.
+- Only resolves `.ts` and `.tsx` modules for this refactor.
+- Skips test-style targets by default such as `*.test.ts(x)`, `*.spec.ts(x)`, `*.stories.ts(x)`, and common `test` / `tests` / `__tests__` folders.
+- Can skip gitignored files during workspace-wide consolidation.
+- Supports path-alias imports such as `@/components/ui/button` as well as relative imports.
+
+Example:
+
+```ts
+import { Button } from '@/components/ui/button'
+import { Label } from '@/components/ui/label'
+import { Card } from '@/components/ui/card'
+```
+
+with a barrel like:
+
+```ts
+export { Button } from './button'
+export { Label } from './label'
+```
+
+becomes:
+
+```ts
+import { Button, Label } from '@/components/ui'
+import { Card } from '@/components/ui/card'
+```
+
+This is mainly intended for `shadcn/ui`-style folders where you want consumers to converge on the barrel import whenever that barrel already exposes the symbol, without touching tests or ignored files unless you opt into that.
+
+### Consolidate Current File Imports to Detected UI Barrel
+
+- Runs from the active `.ts` or `.tsx` file.
+- Detects eligible configured UI barrel folders directly from that file's imports.
+- If exactly one UI barrel is detected, it uses it immediately.
+- If multiple candidate UI barrels are detected, it lets you choose one.
+- Reuses the same safety rules as the folder-based barrel consolidation command.
+
+This is the faster option when you are editing one file and do not want to switch back to the Explorer to select a folder first.
 
 ### Rename Local Type/Interface to `Props`
 
@@ -161,7 +212,7 @@ export type User = {
 
 ## Settings
 
-The extension contributes 3 settings:
+The extension contributes 6 settings:
 
 - `codeRefinery.rename.updateImports`
   Update TS/JS relative import specifiers in the workspace after file rename.
@@ -172,6 +223,18 @@ The extension contributes 3 settings:
 - `codeRefinery.rename.revealInExplorer`
   Reveal the renamed file in the Explorer after rename.
   Default: `true`
+- `codeRefinery.barrelImports.allowedUiFolders`
+  Workspace-relative folder paths that are allowed targets for barrel import consolidation.
+  Default: `components/ui`, `crc/components/ui`, `shared/ui`, `src/shared/ui`, `src/shared/components/ui`
+- `codeRefinery.barrelImports.excludePatterns`
+  Workspace-relative glob patterns excluded from barrel import consolidation.
+  Default: `**/__tests__/**`, `**/test/**`, `**/tests/**`, `**/*.test.ts`, `**/*.test.tsx`, `**/*.spec.ts`, `**/*.spec.tsx`, `**/*.stories.ts`, `**/*.stories.tsx`
+- `codeRefinery.barrelImports.respectGitIgnore`
+  Skip gitignored files during workspace-wide barrel import consolidation.
+  Default: `true`
+- `codeRefinery.barrelImports.defaultScope`
+  Default scope for barrel import consolidation when both `Current file` and `Workspace` are available.
+  Default: `ask`
 
 ## Where Commands Appear
 
@@ -179,6 +242,7 @@ The extension contributes 3 settings:
   `Convert Filename to kebab-case`
 - Explorer context menu on folders:
   `Generate index.ts with exports`
+  `Consolidate Imports via Folder Barrel`
 - Explorer context menu on `.ts` / `.tsx` files:
   `Rename Local Type/Interface to Props`
   `Convert Default Export to Named Export`

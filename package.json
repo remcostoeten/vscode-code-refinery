@@ -1,7 +1,7 @@
 {
   "name": "code-refinery",
-  "displayName": "code Refinery",
-  "description": "Refine your codebase with ease: rename files, generate index.ts, and more!",
+  "displayName": "Code Refinery",
+  "description": "TypeScript refactors for imports, barrels, props, exports, and cleanup in VS Code.",
   "version": "0.10.0",
   "author": "Remco Stoeten",
   "publisher": "remcostoeten",
@@ -14,11 +14,27 @@
     "vscode": "^1.80.0"
   },
   "categories": [
-    "Other"
+    "Other",
+    "Programming Languages"
   ],
+  "keywords": [
+    "typescript",
+    "refactor",
+    "imports",
+    "barrel",
+    "shadcn",
+    "props",
+    "exports",
+    "cleanup",
+    "tsx",
+    "vscode"
+  ],
+  "icon": "media/icon.png",
   "activationEvents": [
     "onCommand:file-utils.renameFile",
     "onCommand:file-utils.exportIndex",
+    "onCommand:file-utils.consolidateBarrelImports",
+    "onCommand:file-utils.consolidateCurrentFileBarrelImports",
     "onCommand:file-utils.fixPropsType",
     "onCommand:file-utils.convertDefaultToNamed",
     "onCommand:file-utils.convertNamedToDefault",
@@ -35,6 +51,14 @@
       {
         "command": "file-utils.exportIndex",
         "title": "Generate index.ts with exports"
+      },
+      {
+        "command": "file-utils.consolidateBarrelImports",
+        "title": "Consolidate Imports via Folder Barrel"
+      },
+      {
+        "command": "file-utils.consolidateCurrentFileBarrelImports",
+        "title": "Consolidate Current File Imports to Detected UI Barrel"
       },
       {
         "command": "file-utils.fixPropsType",
@@ -74,6 +98,53 @@
           "type": "boolean",
           "default": true,
           "description": "Reveal the renamed file in the Explorer after a rename."
+        },
+        "codeRefinery.barrelImports.allowedUiFolders": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [
+            "components/ui",
+            "crc/components/ui",
+            "shared/ui",
+            "src/shared/ui",
+            "src/shared/components/ui"
+          ],
+          "description": "Workspace-relative UI folder paths that are allowed targets for barrel import consolidation."
+        },
+        "codeRefinery.barrelImports.excludePatterns": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [
+            "**/__tests__/**",
+            "**/test/**",
+            "**/tests/**",
+            "**/*.test.ts",
+            "**/*.test.tsx",
+            "**/*.spec.ts",
+            "**/*.spec.tsx",
+            "**/*.stories.ts",
+            "**/*.stories.tsx"
+          ],
+          "description": "Workspace-relative glob patterns to exclude from barrel import consolidation."
+        },
+        "codeRefinery.barrelImports.respectGitIgnore": {
+          "type": "boolean",
+          "default": true,
+          "description": "When enabled, skip files ignored by git during workspace barrel import consolidation."
+        },
+        "codeRefinery.barrelImports.defaultScope": {
+          "type": "string",
+          "enum": [
+            "ask",
+            "current",
+            "workspace"
+          ],
+          "default": "ask",
+          "description": "Default scope used for barrel import consolidation when both current-file and workspace modes are available."
         }
       }
     },
@@ -86,6 +157,11 @@
         },
         {
           "command": "file-utils.exportIndex",
+          "when": "resourceScheme == file && explorerResourceIsFolder",
+          "group": "navigation"
+        },
+        {
+          "command": "file-utils.consolidateBarrelImports",
           "when": "resourceScheme == file && explorerResourceIsFolder",
           "group": "navigation"
         },

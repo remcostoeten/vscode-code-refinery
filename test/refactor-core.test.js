@@ -1,5 +1,6 @@
 const assert = require("node:assert/strict")
 const {
+    collectBarrelImportConsolidationRewrites,
     buildTypeAliasFromInterface,
     collectDefaultToNamedReferenceRewrites,
     collectNamedToDefaultReferenceRewrites,
@@ -81,6 +82,55 @@ export { Widget as WidgetExport } from './widget';
     assert.match(updated, /import Widget from '\.\/widget';/)
     assert.match(updated, /import WidgetAlias, \{ helper \} from "\.\/widget";/)
     assert.match(updated, /export \{ default as WidgetExport \} from '\.\/widget';/)
+}
+
+{
+    const text = `
+import { Button } from '@/components/ui/button';
+import { Label as FieldLabel } from "@/components/ui/label";
+import { Card } from "@/components/ui/card";
+
+export const value = [Button, FieldLabel, Card];
+`
+    const sourceFile = createSourceFile("/tmp/consumer.tsx", text)
+    const rewrites = collectBarrelImportConsolidationRewrites(sourceFile, [
+        {
+            sourceModule: "@/components/ui/button",
+            barrelModule: "@/components/ui",
+            exportedNames: ["Button"]
+        },
+        {
+            sourceModule: "@/components/ui/label",
+            barrelModule: "@/components/ui",
+            exportedNames: ["Label"]
+        }
+    ])
+    const updated = applyRewrites(text, rewrites)
+    assert.doesNotMatch(updated, /from '.*ui\/button'/)
+    assert.doesNotMatch(updated, /from ".*ui\/label"/)
+    assert.match(updated, /import \{ Button, Label as FieldLabel \} from '@\/components\/ui';/)
+    assert.match(updated, /import \{ Card \} from "@\/components\/ui\/card";/)
+}
+
+{
+    const text = `
+import { Button } from '@/components/ui';
+import { Label } from '@/components/ui/label';
+
+export const value = [Button, Label];
+`
+    const sourceFile = createSourceFile("/tmp/consumer.tsx", text)
+    const rewrites = collectBarrelImportConsolidationRewrites(sourceFile, [
+        {
+            sourceModule: "@/components/ui/label",
+            barrelModule: "@/components/ui",
+            exportedNames: ["Label"]
+        }
+    ])
+    const updated = applyRewrites(text, rewrites)
+    assert.match(updated, /import \{ Button, Label \} from '@\/components\/ui';/)
+    assert.match(updated, /export const value = \[Button, Label\];/)
+    assert.doesNotMatch(updated, /from '@\/components\/ui\/label';/)
 }
 
 console.log("refactor-core tests passed")

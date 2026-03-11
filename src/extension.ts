@@ -2,15 +2,18 @@ import * as path from "path"
 import * as ts from "typescript"
 import * as vscode from "vscode"
 import {
+    type TBarrelImportRewritePlan,
     type TExportRewrite,
     type TTypeLikeDecl,
     buildExportDeclarationText,
     buildTypeAliasFromInterface,
+    collectBarrelImportConsolidationRewrites,
     collectDefaultToNamedReferenceRewrites,
     collectNamedToDefaultReferenceRewrites,
     createSourceFile,
     getTopLevelTypeLikeDecls
 } from "./refactor-core"
+import { execFileSync } from "child_process"
 
 let outputChannel: vscode.OutputChannel | undefined
 
@@ -121,6 +124,35 @@ function getRenameConfig() {
     }
 }
 
+function getBarrelImportConfig(): TBarrelImportConfig {
+    const cfg = vscode.workspace.getConfiguration()
+    return {
+        allowedUiFolders: cfg.get<string[]>("codeRefinery.barrelImports.allowedUiFolders", [
+            "components/ui",
+            "crc/components/ui",
+            "shared/ui",
+            "src/shared/ui",
+            "src/shared/components/ui"
+        ]),
+        excludePatterns: cfg.get<string[]>("codeRefinery.barrelImports.excludePatterns", [
+            "**/__tests__/**",
+            "**/test/**",
+            "**/tests/**",
+            "**/*.test.ts",
+            "**/*.test.tsx",
+            "**/*.spec.ts",
+            "**/*.spec.tsx",
+            "**/*.stories.ts",
+            "**/*.stories.tsx"
+        ]),
+        respectGitIgnore: cfg.get<boolean>("codeRefinery.barrelImports.respectGitIgnore", true),
+        defaultScope: cfg.get<"current" | "workspace" | "ask">(
+            "codeRefinery.barrelImports.defaultScope",
+            "ask"
+        )
+    }
+}
+
 function normalizeRelativeImportPath(p: string): string {
     const posix = p.split(path.sep).join("/")
     if (posix.startsWith(".")) return posix
@@ -154,6 +186,19 @@ type TTsServiceContext = {
     rootPath: string
 }
 
+type TTsProjectInfo = {
+    rootPath: string
+    options: ts.CompilerOptions
+    fileNames: string[]
+}
+
+type TBarrelImportConfig = {
+    allowedUiFolders: string[]
+    excludePatterns: string[]
+    respectGitIgnore: boolean
+    defaultScope: "current" | "workspace" | "ask"
+}
+
 type TUnusedCategory = "imports" | "types" | "interfaces" | "exports" | "functions" | "variables"
 
 function hasModifier(node: ts.Node, kind: ts.SyntaxKind): boolean {
@@ -175,7 +220,7 @@ async function findWorkspaceTypeScriptFiles(): Promise<string[]> {
     return uris.map((uri) => uri.fsPath)
 }
 
-async function createTypeScriptLanguageService(targetFilePath: string): Promise<TTsServiceContext> {
+async function getTypeScriptProjectInfo(targetFilePath: string): Promise<TTsProjectInfo> {
     const workspaceFolder =
         vscode.workspace.getWorkspaceFolder(vscode.Uri.file(targetFilePath)) ??
         vscode.workspace.workspaceFolders?.[0]
@@ -214,6 +259,16 @@ async function createTypeScriptLanguageService(targetFilePath: string): Promise<
         fileNames.push(targetFilePath)
     }
 
+    return {
+        rootPath,
+        options,
+        fileNames
+    }
+}
+
+async function createTypeScriptLanguageService(targetFilePath: string): Promise<TTsServiceContext> {
+    const project = await getTypeScriptProjectInfo(targetFilePath)
+
     const openDocs = new Map<string, string>()
     for (const doc of vscode.workspace.textDocuments) {
         if (doc.uri.scheme === "file" && /\.(ts|tsx)$/.test(doc.uri.fsPath)) {
@@ -222,11 +277,11 @@ async function createTypeScriptLanguageService(targetFilePath: string): Promise<
     }
 
     const host: ts.LanguageServiceHost = {
-        getCompilationSettings: () => options,
-        getCurrentDirectory: () => rootPath,
+        getCompilationSettings: () => project.options,
+        getCurrentDirectory: () => project.rootPath,
         getDefaultLibFileName: ts.getDefaultLibFilePath,
         getNewLine: () => ts.sys.newLine,
-        getScriptFileNames: () => fileNames,
+        getScriptFileNames: () => project.fileNames,
         getScriptVersion: () => "0",
         getScriptSnapshot: (fileName) => {
             const text = openDocs.get(fileName) ?? ts.sys.readFile(fileName)
@@ -242,8 +297,375 @@ async function createTypeScriptLanguageService(targetFilePath: string): Promise<
 
     return {
         languageService: ts.createLanguageService(host, ts.createDocumentRegistry()),
-        rootPath
+        rootPath: project.rootPath
     }
+}
+
+function resolveModuleFilePath(
+    containingFilePath: string,
+    moduleSpecifier: string,
+    options: ts.CompilerOptions
+): string | undefined {
+    const resolved = ts.resolveModuleName(moduleSpecifier, containingFilePath, options, ts.sys)
+        .resolvedModule?.resolvedFileName
+    if (
+        !resolved ||
+        resolved.endsWith(".d.ts") ||
+        resolved.includes(`${path.sep}node_modules${path.sep}`) ||
+        !/\.(ts|tsx)$/.test(resolved)
+    ) {
+        return undefined
+    }
+
+    return path.normalize(resolved)
+}
+
+function isPathInsideFolder(filePath: string, folderPath: string): boolean {
+    const relative = path.relative(folderPath, filePath)
+    return relative !== "" && !relative.startsWith("..") && !path.isAbsolute(relative)
+}
+
+function normalizeFolderPattern(input: string): string {
+    return input
+        .replace(/\\/g, "/")
+        .replace(/^\.\//, "")
+        .replace(/^\/+|\/+$/g, "")
+}
+
+function isAllowedUiFolder(
+    folderPath: string,
+    workspaceRoot: string,
+    allowedUiFolders: string[]
+): boolean {
+    const relativePath = path.relative(workspaceRoot, folderPath).replace(/\\/g, "/")
+    if (!relativePath || relativePath.startsWith("..") || path.isAbsolute(relativePath)) {
+        return false
+    }
+
+    const normalizedRelativePath = normalizeFolderPattern(relativePath)
+    return allowedUiFolders
+        .map(normalizeFolderPattern)
+        .some(
+            (allowedPath) =>
+                normalizedRelativePath === allowedPath ||
+                normalizedRelativePath.endsWith(`/${allowedPath}`)
+        )
+}
+
+function escapeRegex(text: string): string {
+    return text.replace(/[|\\{}()[\]^$+?.]/g, "\\$&")
+}
+
+function globToRegExp(glob: string): RegExp {
+    const pattern = normalizeFolderPattern(glob)
+    let out = "^"
+
+    for (let index = 0; index < pattern.length; index++) {
+        const char = pattern[index]
+        const next = pattern[index + 1]
+
+        if (char === "*") {
+            if (next === "*") {
+                const afterNext = pattern[index + 2]
+                if (afterNext === "/") {
+                    out += "(?:.*/)?"
+                    index += 2
+                } else {
+                    out += ".*"
+                    index += 1
+                }
+            } else {
+                out += "[^/]*"
+            }
+            continue
+        }
+
+        if (char === "?") {
+            out += "[^/]"
+            continue
+        }
+
+        out += escapeRegex(char)
+    }
+
+    out += "$"
+    return new RegExp(out)
+}
+
+function matchesAnyGlob(relativePath: string, patterns: string[]): boolean {
+    const normalizedPath = normalizeFolderPattern(relativePath)
+    return patterns.some((pattern) => globToRegExp(pattern).test(normalizedPath))
+}
+
+function getWorkspaceRelativePath(filePath: string, workspaceRoot: string): string | undefined {
+    const relativePath = path.relative(workspaceRoot, filePath).replace(/\\/g, "/")
+    if (!relativePath || relativePath.startsWith("..") || path.isAbsolute(relativePath)) {
+        return undefined
+    }
+
+    return normalizeFolderPattern(relativePath)
+}
+
+function shouldSkipBarrelImportTarget(
+    filePath: string,
+    workspaceRoot: string,
+    config: TBarrelImportConfig
+): boolean {
+    if (!/\.(ts|tsx)$/.test(filePath)) {
+        return true
+    }
+    if (filePath.includes(`${path.sep}node_modules${path.sep}`)) {
+        return true
+    }
+
+    const relativePath = getWorkspaceRelativePath(filePath, workspaceRoot)
+    if (!relativePath) {
+        return true
+    }
+
+    return matchesAnyGlob(relativePath, config.excludePatterns)
+}
+
+function filterGitIgnoredPaths(filePaths: string[], workspaceRoot: string): string[] {
+    if (filePaths.length === 0) {
+        return filePaths
+    }
+
+    try {
+        const output = execFileSync("git", ["check-ignore", ...filePaths], {
+            cwd: workspaceRoot,
+            encoding: "utf8",
+            stdio: ["ignore", "pipe", "ignore"]
+        })
+        const ignored = new Set(
+            output
+                .split(/\r?\n/)
+                .map((line) => line.trim())
+                .filter(Boolean)
+                .map((filePath) => path.normalize(filePath))
+        )
+        return filePaths.filter((filePath) => !ignored.has(path.normalize(filePath)))
+    } catch {
+        return filePaths
+    }
+}
+
+function findBarrelFilePath(folderPath: string): string | undefined {
+    for (const candidate of ["index.ts", "index.tsx"]) {
+        const fullPath = path.join(folderPath, candidate)
+        if (ts.sys.fileExists(fullPath)) {
+            return fullPath
+        }
+    }
+
+    return undefined
+}
+
+function collectNamedExportsFromLocalSourceFile(
+    filePath: string,
+    seen = new Set<string>()
+): Set<string> {
+    if (seen.has(filePath)) {
+        return new Set()
+    }
+    seen.add(filePath)
+
+    const text = ts.sys.readFile(filePath)
+    if (text === undefined) {
+        return new Set()
+    }
+
+    const sourceFile = createSourceFile(filePath, text)
+    const exportedNames = new Set<string>()
+
+    for (const statement of sourceFile.statements) {
+        if (
+            (ts.isFunctionDeclaration(statement) ||
+                ts.isClassDeclaration(statement) ||
+                ts.isTypeAliasDeclaration(statement) ||
+                ts.isInterfaceDeclaration(statement)) &&
+            hasModifier(statement, ts.SyntaxKind.ExportKeyword) &&
+            !hasModifier(statement, ts.SyntaxKind.DefaultKeyword) &&
+            statement.name
+        ) {
+            exportedNames.add(statement.name.text)
+            continue
+        }
+
+        if (
+            ts.isVariableStatement(statement) &&
+            hasModifier(statement, ts.SyntaxKind.ExportKeyword)
+        ) {
+            for (const declaration of statement.declarationList.declarations) {
+                if (ts.isIdentifier(declaration.name)) {
+                    exportedNames.add(declaration.name.text)
+                }
+            }
+            continue
+        }
+
+        if (
+            ts.isExportDeclaration(statement) &&
+            !statement.moduleSpecifier &&
+            statement.exportClause &&
+            ts.isNamedExports(statement.exportClause)
+        ) {
+            for (const element of statement.exportClause.elements) {
+                exportedNames.add(element.name.text)
+            }
+        }
+    }
+
+    return exportedNames
+}
+
+function addExportedNames(
+    exportMap: Map<string, Set<string>>,
+    filePath: string,
+    names: Iterable<string>
+) {
+    const normalizedPath = path.normalize(filePath)
+    const existing = exportMap.get(normalizedPath)
+    if (existing) {
+        for (const name of names) {
+            existing.add(name)
+        }
+        return
+    }
+
+    exportMap.set(normalizedPath, new Set(names))
+}
+
+function collectBarrelExportMap(
+    barrelFilePath: string,
+    options: ts.CompilerOptions
+): Map<string, Set<string>> {
+    const text = ts.sys.readFile(barrelFilePath)
+    if (text === undefined) {
+        return new Map()
+    }
+
+    const sourceFile = createSourceFile(barrelFilePath, text)
+    const exportMap = new Map<string, Set<string>>()
+
+    for (const statement of sourceFile.statements) {
+        if (
+            !ts.isExportDeclaration(statement) ||
+            !statement.moduleSpecifier ||
+            !ts.isStringLiteral(statement.moduleSpecifier)
+        ) {
+            continue
+        }
+
+        const resolvedFilePath = resolveModuleFilePath(
+            barrelFilePath,
+            statement.moduleSpecifier.text,
+            options
+        )
+        if (!resolvedFilePath) {
+            continue
+        }
+
+        if (statement.exportClause && ts.isNamedExports(statement.exportClause)) {
+            addExportedNames(
+                exportMap,
+                resolvedFilePath,
+                statement.exportClause.elements.map((element) => element.name.text)
+            )
+            continue
+        }
+
+        if (!statement.exportClause) {
+            addExportedNames(
+                exportMap,
+                resolvedFilePath,
+                collectNamedExportsFromLocalSourceFile(resolvedFilePath)
+            )
+        }
+    }
+
+    return exportMap
+}
+
+function getBarrelSpecifierForImport(
+    importSpecifier: string,
+    targetFolderPath: string,
+    resolvedImportFilePath: string
+): string | undefined {
+    const normalizedImportSpecifier = stripKnownScriptExtension(importSpecifier)
+        .replace(/\\/g, "/")
+        .replace(/\/index$/, "")
+    const relativeChildPath = stripKnownScriptExtension(
+        path.relative(targetFolderPath, resolvedImportFilePath).split(path.sep).join("/")
+    )
+
+    if (!relativeChildPath || relativeChildPath.startsWith("..")) {
+        return undefined
+    }
+
+    const suffix = `/${relativeChildPath}`
+    if (!normalizedImportSpecifier.endsWith(suffix)) {
+        return undefined
+    }
+
+    return normalizedImportSpecifier.slice(0, -suffix.length)
+}
+
+function collectBarrelImportPlansForFile(
+    sourceFile: ts.SourceFile,
+    filePath: string,
+    targetFolderPath: string,
+    barrelExportMap: Map<string, Set<string>>,
+    options: ts.CompilerOptions
+): TBarrelImportRewritePlan[] {
+    const planBySourceModule = new Map<string, TBarrelImportRewritePlan>()
+
+    for (const statement of sourceFile.statements) {
+        if (!ts.isImportDeclaration(statement) || !ts.isStringLiteral(statement.moduleSpecifier)) {
+            continue
+        }
+
+        const sourceModule = statement.moduleSpecifier.text
+        const resolvedImportFilePath = resolveModuleFilePath(filePath, sourceModule, options)
+        if (
+            !resolvedImportFilePath ||
+            !isPathInsideFolder(resolvedImportFilePath, targetFolderPath)
+        ) {
+            continue
+        }
+
+        const exportedNames = barrelExportMap.get(path.normalize(resolvedImportFilePath))
+        if (!exportedNames || exportedNames.size === 0) {
+            continue
+        }
+
+        const barrelModule = getBarrelSpecifierForImport(
+            sourceModule,
+            targetFolderPath,
+            resolvedImportFilePath
+        )
+        if (!barrelModule || barrelModule === sourceModule) {
+            continue
+        }
+
+        const existing = planBySourceModule.get(sourceModule)
+        if (existing) {
+            for (const name of exportedNames) {
+                if (!existing.exportedNames.includes(name)) {
+                    existing.exportedNames.push(name)
+                }
+            }
+            continue
+        }
+
+        planBySourceModule.set(sourceModule, {
+            sourceModule,
+            barrelModule,
+            exportedNames: Array.from(exportedNames)
+        })
+    }
+
+    return Array.from(planBySourceModule.values())
 }
 
 async function applyFileTextChanges(
@@ -1594,6 +2016,244 @@ async function generateIndexFile(uri: vscode.Uri) {
     }
 }
 
+async function consolidateImportsToBarrel(uri?: vscode.Uri) {
+    if (!uri) {
+        vscode.window.showErrorMessage("No folder selected")
+        return
+    }
+
+    const resourceType = await getResourceType(uri)
+    if (resourceType !== vscode.FileType.Directory) {
+        vscode.window.showErrorMessage("Please select a folder.")
+        return
+    }
+
+    const folderPath = uri.fsPath
+    const barrelImportConfig = getBarrelImportConfig()
+    const workspaceRoot =
+        vscode.workspace.getWorkspaceFolder(uri)?.uri.fsPath ??
+        vscode.workspace.workspaceFolders?.[0]?.uri.fsPath
+    if (!workspaceRoot) {
+        vscode.window.showErrorMessage("Open a workspace folder before running this command.")
+        return
+    }
+    if (
+        folderPath.includes(`${path.sep}node_modules${path.sep}`) ||
+        !isAllowedUiFolder(folderPath, workspaceRoot, barrelImportConfig.allowedUiFolders)
+    ) {
+        vscode.window.showErrorMessage(
+            "Selected folder is not an allowed UI barrel path for this command."
+        )
+        return
+    }
+
+    const barrelFilePath = findBarrelFilePath(folderPath)
+    if (!barrelFilePath) {
+        vscode.window.showErrorMessage("Selected folder does not contain index.ts or index.tsx.")
+        return
+    }
+
+    const activeUri = resolveTargetUri()
+    const scopeOptions: Array<{ label: string; value: "current" | "workspace" }> = []
+    if (activeUri && /\.(ts|tsx)$/.test(activeUri.fsPath)) {
+        scopeOptions.push({ label: "Current file", value: "current" })
+    }
+    scopeOptions.push({ label: "Workspace", value: "workspace" })
+
+    const selectedScope =
+        scopeOptions.length === 1
+            ? scopeOptions[0]
+            : barrelImportConfig.defaultScope !== "ask"
+              ? (scopeOptions.find((option) => option.value === barrelImportConfig.defaultScope) ??
+                scopeOptions[0])
+              : await vscode.window.showQuickPick(scopeOptions, {
+                    placeHolder:
+                        "Choose where to consolidate imports that target this barrel folder"
+                })
+    if (!selectedScope) {
+        return
+    }
+
+    let targetFilePaths =
+        selectedScope.value === "current"
+            ? activeUri
+                ? [activeUri.fsPath]
+                : []
+            : await findWorkspaceTypeScriptFiles()
+    targetFilePaths = targetFilePaths.filter(
+        (filePath) => !shouldSkipBarrelImportTarget(filePath, workspaceRoot, barrelImportConfig)
+    )
+    if (barrelImportConfig.respectGitIgnore) {
+        targetFilePaths = filterGitIgnoredPaths(targetFilePaths, workspaceRoot)
+    }
+    if (targetFilePaths.length === 0) {
+        vscode.window.showInformationMessage("No TypeScript files found to update.")
+        return
+    }
+
+    const project = await getTypeScriptProjectInfo(barrelFilePath)
+    const barrelExportMap = collectBarrelExportMap(barrelFilePath, project.options)
+    if (barrelExportMap.size === 0) {
+        vscode.window.showInformationMessage(
+            "No named exports were found in the selected folder barrel."
+        )
+        return
+    }
+
+    const workspaceEdit = new vscode.WorkspaceEdit()
+    const changedUris: vscode.Uri[] = []
+    const detailLines: string[] = []
+    let changedFiles = 0
+    let consolidatedImports = 0
+
+    for (const filePath of targetFilePaths) {
+        if (path.normalize(filePath) === path.normalize(barrelFilePath)) {
+            continue
+        }
+
+        const uriToEdit = vscode.Uri.file(filePath)
+        const doc = await vscode.workspace.openTextDocument(uriToEdit)
+        const sourceFile = createSourceFile(filePath, doc.getText())
+        const plans = collectBarrelImportPlansForFile(
+            sourceFile,
+            filePath,
+            folderPath,
+            barrelExportMap,
+            project.options
+        )
+        if (plans.length === 0) {
+            continue
+        }
+
+        const rewrites = collectBarrelImportConsolidationRewrites(sourceFile, plans)
+        if (rewrites.length === 0) {
+            continue
+        }
+
+        changedFiles++
+        consolidatedImports += plans.length
+        changedUris.push(uriToEdit)
+        const barrelTargets = Array.from(new Set(plans.map((plan) => plan.barrelModule))).sort()
+        detailLines.push(
+            `[barrel-imports] ${path.relative(project.rootPath, filePath)}: ${plans.length} source import(s) -> ${barrelTargets.join(", ")}`
+        )
+
+        for (const rewrite of rewrites.sort((left, right) => right.start - left.start)) {
+            workspaceEdit.replace(
+                uriToEdit,
+                new vscode.Range(doc.positionAt(rewrite.start), doc.positionAt(rewrite.end)),
+                rewrite.replacement
+            )
+        }
+    }
+
+    if (workspaceEdit.size === 0) {
+        vscode.window.showInformationMessage(
+            "No eligible imports were found that can be safely consolidated through this barrel."
+        )
+        return
+    }
+
+    const shouldApply = await confirmCommandPreview(
+        `Consolidate ${consolidatedImports} import source(s) into ${path.basename(folderPath)} barrel imports across ${changedFiles} file(s)?`,
+        detailLines
+    )
+    if (!shouldApply) {
+        return
+    }
+
+    const applied = await applyWorkspaceEditAndSave(workspaceEdit, changedUris)
+    if (!applied) {
+        vscode.window.showErrorMessage("Failed to apply the barrel import consolidation edits.")
+        return
+    }
+
+    await showCommandSummary(
+        `Consolidated imports through ${path.basename(barrelFilePath)} in ${changedFiles} file(s).`,
+        detailLines
+    )
+}
+
+async function consolidateCurrentFileImportsToDetectedBarrel() {
+    const targetUri = resolveTargetUri()
+    if (!targetUri) {
+        vscode.window.showErrorMessage("No file selected.")
+        return
+    }
+
+    if (!/\.(ts|tsx)$/.test(targetUri.fsPath)) {
+        vscode.window.showErrorMessage("Please select a .ts or .tsx file.")
+        return
+    }
+
+    const workspaceRoot =
+        vscode.workspace.getWorkspaceFolder(targetUri)?.uri.fsPath ??
+        vscode.workspace.workspaceFolders?.[0]?.uri.fsPath
+    if (!workspaceRoot) {
+        vscode.window.showErrorMessage("Open a workspace folder before running this command.")
+        return
+    }
+
+    const barrelImportConfig = getBarrelImportConfig()
+    const project = await getTypeScriptProjectInfo(targetUri.fsPath)
+    const doc = await vscode.workspace.openTextDocument(targetUri)
+    const sourceFile = createSourceFile(targetUri.fsPath, doc.getText())
+    const candidateFolders = new Set<string>()
+
+    for (const statement of sourceFile.statements) {
+        if (!ts.isImportDeclaration(statement) || !ts.isStringLiteral(statement.moduleSpecifier)) {
+            continue
+        }
+
+        const resolvedImportFilePath = resolveModuleFilePath(
+            targetUri.fsPath,
+            statement.moduleSpecifier.text,
+            project.options
+        )
+        if (!resolvedImportFilePath) {
+            continue
+        }
+
+        const folderPath = path.dirname(resolvedImportFilePath)
+        if (
+            isAllowedUiFolder(folderPath, workspaceRoot, barrelImportConfig.allowedUiFolders) &&
+            findBarrelFilePath(folderPath)
+        ) {
+            candidateFolders.add(folderPath)
+        }
+    }
+
+    const folders = Array.from(candidateFolders).sort((left, right) => left.localeCompare(right))
+    if (folders.length === 0) {
+        vscode.window.showInformationMessage(
+            "No eligible UI barrel folder was detected from the current file imports."
+        )
+        return
+    }
+
+    const selectedFolder =
+        folders.length === 1
+            ? folders[0]
+            : (
+                  await vscode.window.showQuickPick(
+                      folders.map((folderPath) => ({
+                          label: path.relative(workspaceRoot, folderPath).replace(/\\/g, "/"),
+                          value: folderPath
+                      })),
+                      {
+                          placeHolder:
+                              "Choose the detected UI barrel folder to consolidate imports through"
+                      }
+                  )
+              )?.value
+
+    if (!selectedFolder) {
+        return
+    }
+
+    await consolidateImportsToBarrel(vscode.Uri.file(selectedFolder))
+}
+
 export function activate(context: vscode.ExtensionContext) {
     const renameDisposable = vscode.commands.registerCommand(
         "file-utils.renameFile",
@@ -1602,6 +2262,14 @@ export function activate(context: vscode.ExtensionContext) {
     const exportDisposable = vscode.commands.registerCommand(
         "file-utils.exportIndex",
         generateIndexFile
+    )
+    const consolidateBarrelImportsDisposable = vscode.commands.registerCommand(
+        "file-utils.consolidateBarrelImports",
+        consolidateImportsToBarrel
+    )
+    const consolidateCurrentFileBarrelImportsDisposable = vscode.commands.registerCommand(
+        "file-utils.consolidateCurrentFileBarrelImports",
+        consolidateCurrentFileImportsToDetectedBarrel
     )
     const fixPropsDisposable = vscode.commands.registerCommand(
         "file-utils.fixPropsType",
@@ -1627,6 +2295,8 @@ export function activate(context: vscode.ExtensionContext) {
     context.subscriptions.push(
         renameDisposable,
         exportDisposable,
+        consolidateBarrelImportsDisposable,
+        consolidateCurrentFileBarrelImportsDisposable,
         fixPropsDisposable,
         defaultToNamedDisposable,
         namedToDefaultDisposable,
