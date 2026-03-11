@@ -2,7 +2,7 @@
   "name": "code-refinery",
   "displayName": "Code Refinery",
   "description": "TypeScript refactors for imports, barrels, props, exports, and cleanup in VS Code.",
-  "version": "0.10.0",
+  "version": "0.10.1",
   "author": "Remco Stoeten",
   "publisher": "remcostoeten",
   "license": "MIT",
